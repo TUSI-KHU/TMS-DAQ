@@ -14,7 +14,7 @@ def test_field_connection_is_fixed_for_the_closed_wired_network(tmp_path) -> Non
 
     config = apply_field_connection(source)
 
-    assert config.system.pi_host == "192.168.0.214"
+    assert config.system.pi_host == "10.47.0.2"
     assert config.system.telemetry_port == 29100
     assert config.ssh.port == 22
     assert config.ssh.username == "tms"

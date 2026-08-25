@@ -267,6 +267,13 @@ class Usb4704BufferedDevice:
             raise Usb4704NativeError("USB-4704 buffered acquisition is not running")
         deadline = time.monotonic() + timeout
         wanted_values = self.block_frames * self.channel_count
+        # The vendor ABI exposes a shared status page but no waitable file
+        # descriptor. Poll at most twice per expected block instead of waking
+        # Python every millisecond. At the field default (50 frames / 5 kS/s)
+        # this is 5 ms: all samples remain in the driver's ring buffer while
+        # substantially reducing idle CPU wakeups.
+        block_period = self.block_frames / self.sample_rate
+        poll_interval = min(0.010, max(0.001, block_period / 2.0))
 
         while not stop_event.is_set():
             status = self._shared.fai_status
@@ -290,7 +297,7 @@ class Usb4704BufferedDevice:
                 raise Usb4704NativeError(
                     f"USB-4704 produced no complete block for {timeout:.1f} s"
                 )
-            stop_event.wait(0.001)
+            stop_event.wait(poll_interval)
 
         raise InterruptedError("USB-4704 read interrupted")
 

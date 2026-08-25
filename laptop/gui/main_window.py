@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,12 +39,15 @@ from common.config import (
     DaqConfig,
     LoggingConfig,
     NanoConfig,
+    SECOND_SENSOR_AI_CHANNEL,
     SshConfig,
     SystemConfig,
+    THRUST_AI_CHANNEL,
     TmsConfig,
     save_config,
 )
 from common.protocol import TelemetryBlock
+from laptop.gui.calibration_dialog import LoadCellCalibrationDialog
 from laptop.gui.runtime import BackendRuntime, BackendSignals
 from laptop.logs import LogError, export_csv, list_sessions
 from laptop.operator_defaults import apply_field_connection
@@ -87,7 +90,12 @@ CHANNEL_DISPLAYS: dict[str, ChannelDisplay] = {
     "raw_pressure": ChannelDisplay("압력 원시값", "ADC", "#ff832b", 0),
 }
 DEFAULT_LIVE_CHANNELS = ("thrust_N", "pressure_bar")
-NORMALIZED_DECIMALS = 3
+
+# Retain a full 10-second physical-value history for metrics and log context,
+# but draw only a peak-preserving envelope.  Rendering the whole 50,000 point
+# window for two panels on every 10 ms DAQ block is what made the UI sluggish.
+PLOT_MAX_POINTS = 2_000
+PLOT_REFRESH_INTERVAL_SEC = 0.10
 
 
 class MainWindow(QMainWindow):
@@ -106,6 +114,10 @@ class MainWindow(QMainWindow):
         self.direct_telemetry = direct_telemetry
         self.setWindowTitle("TUSI TMS")
         self.resize(1180, 850)
+        # Anti-aliasing is disproportionately expensive for continuously
+        # redrawn time-series curves and does not improve operator readability
+        # at the dashboard's live update rate.
+        pg.setConfigOptions(antialias=False)
         self._signals = BackendSignals()
         self._runtime: BackendRuntime | None = None
         self._status_labels: dict[str, QLabel] = {}
@@ -114,12 +126,13 @@ class MainWindow(QMainWindow):
         self._channel_names: tuple[str, ...] = ()
         self._channel_values: dict[str, np.ndarray] = {}
         self._peak_values: dict[str, float] = {}
-        self._channel_bounds: dict[str, tuple[float, float]] = {}
         self._signal_panels: list[SignalPanel] = []
         self._last_sample_rate = self.config.daq.sample_rate
         self._trigger_sample: int | None = None
         self._last_plot_update = 0.0
         self._sessions = []
+        self._calibration_dialog: LoadCellCalibrationDialog | None = None
+        self._daq_reset_in_progress = False
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard(), "Dashboard")
@@ -137,14 +150,6 @@ class MainWindow(QMainWindow):
         title = QLabel("TUSI TMS · 통합 계측 콘솔")
         title.setStyleSheet("font-size: 24px; font-weight: bold; padding: 4px 0;")
         layout.addWidget(title)
-
-        subtitle = QLabel(
-            "좌측 상단과 우측 상단에서 표시할 실시간 채널을 선택할 수 있습니다. "
-            "상태와 측정 제어는 하단 패널에 항상 표시됩니다."
-        )
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #525252;")
-        layout.addWidget(subtitle)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
@@ -186,22 +191,23 @@ class MainWindow(QMainWindow):
         selection.addWidget(selector, 1)
         layout.addLayout(selection)
 
-        pg.setConfigOptions(antialias=True)
         plot = pg.PlotWidget()
         plot.setMinimumHeight(235)
         plot.showGrid(x=True, y=True, alpha=0.22)
         curve = plot.plot(pen=pg.mkPen("#0f62fe", width=2))
+        curve.setClipToView(True)
+        curve.setDownsampling(auto=True, method="peak")
         layout.addWidget(plot, 1)
 
         metrics = QGridLayout()
         current = QLabel("--")
         peak = QLabel("--")
-        range_label = QLabel("자동 min–max: --")
+        range_label = QLabel("Y축 자동 범위: --")
         for value in (current, peak):
             value.setStyleSheet("font-size: 19px; font-weight: bold;")
         range_label.setStyleSheet("color: #525252;")
-        metrics.addWidget(QLabel("정규화 현재 (0–1)"), 0, 0)
-        metrics.addWidget(QLabel("세션 최대 (원본)"), 0, 1)
+        metrics.addWidget(QLabel("현재값"), 0, 0)
+        metrics.addWidget(QLabel("세션 최대"), 0, 1)
         metrics.addWidget(current, 1, 0)
         metrics.addWidget(peak, 1, 1)
         metrics.addWidget(range_label, 2, 0, 1, 2)
@@ -283,6 +289,19 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.stop_button)
         layout.addLayout(controls)
 
+        self.calibration_button = QPushButton("AI0 로드셀 보정")
+        self.calibration_button.setToolTip(
+            "실행 전 AI0 원시값을 취득해 2점 또는 3점 질량 보정을 저장합니다"
+        )
+        layout.addWidget(self.calibration_button)
+
+        self.daq_reset_button = QPushButton("DAQ 초기화")
+        self.daq_reset_button.setEnabled(False)
+        self.daq_reset_button.setToolTip(
+            "측정 전 USB-4704 드라이버/USB 장치를 재초기화하고 /dev/daq0을 복구합니다"
+        )
+        layout.addWidget(self.daq_reset_button)
+
         self.quick_settings_summary = QLabel()
         self.quick_settings_summary.setWordWrap(True)
         self.quick_settings_summary.setStyleSheet(
@@ -310,6 +329,8 @@ class MainWindow(QMainWindow):
 
         self.start_button.clicked.connect(self._start_session)
         self.stop_button.clicked.connect(self._stop_session)
+        self.calibration_button.clicked.connect(self._open_calibration)
+        self.daq_reset_button.clicked.connect(self._reset_daq)
         setup_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
         system_test_button.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
         logs_button.clicked.connect(lambda: self.tabs.setCurrentIndex(3))
@@ -352,11 +373,11 @@ class MainWindow(QMainWindow):
         if not channel_name:
             return
         display = self._channel_display(channel_name)
-        panel.plot.setTitle(f"{display.label} · AUTO MIN–MAX")
-        panel.plot.setLabel("left", "정규화 값", units="0–1")
+        panel.plot.setTitle(f"{display.label} · Y축 자동 범위")
+        panel.plot.setLabel("left", display.label, units=display.unit)
         panel.plot.setLabel("bottom", "시간", units="s")
         panel.curve.setPen(pg.mkPen(display.color, width=2))
-        panel.range_label.setText(f"자동 min–max · {display.label}: 데이터 대기")
+        panel.range_label.setText(f"Y축 자동 범위 · {display.label}: 데이터 대기")
 
     def _sync_channel_selectors(self, channel_names: tuple[str, ...]) -> None:
         available = channel_names or DEFAULT_LIVE_CHANNELS
@@ -396,58 +417,89 @@ class MainWindow(QMainWindow):
                 panel.current.setText("--")
                 panel.peak.setText("--")
                 continue
-            normalized = self._normalize_channel_values(channel_name, values)
-            panel.curve.setData(times, normalized)
-            self._update_signal_panel_metrics(panel, values, normalized)
+            display_indices = self._peak_display_indices(values)
+            panel.curve.setData(times[display_indices], values[display_indices])
+            self._autoscale_panel_y(panel, values)
+            self._update_signal_panel_metrics(panel, values)
+
+    @staticmethod
+    def _peak_display_indices(values: np.ndarray) -> np.ndarray:
+        """Return an ordered, bounded-size envelope that retains local peaks.
+
+        The data acquisition path continues to hold every sample.  This only
+        controls the number of points passed to pyqtgraph for screen drawing,
+        using the minimum and maximum of each time bucket so short pressure or
+        thrust peaks do not disappear from the operator view.
+        """
+        sample_count = len(values)
+        if sample_count <= PLOT_MAX_POINTS:
+            return np.arange(sample_count, dtype=np.intp)
+
+        bucket_limit = max(1, PLOT_MAX_POINTS // 2)
+        bucket_size = int(np.ceil(sample_count / bucket_limit))
+        bucket_count = int(np.ceil(sample_count / bucket_size))
+        padded_count = bucket_count * bucket_size
+        padded = np.full(padded_count, np.nan, dtype=np.float32)
+        padded[:sample_count] = values
+        buckets = padded.reshape(bucket_count, bucket_size)
+        finite = np.isfinite(buckets)
+        valid_buckets = np.any(finite, axis=1)
+        if not np.any(valid_buckets):
+            return np.linspace(
+                0, sample_count - 1, PLOT_MAX_POINTS, dtype=np.intp
+            )
+
+        starts = np.arange(bucket_count, dtype=np.intp) * bucket_size
+        minimum_offsets = np.argmin(
+            np.where(finite, buckets, np.inf), axis=1
+        ).astype(np.intp)
+        maximum_offsets = np.argmax(
+            np.where(finite, buckets, -np.inf), axis=1
+        ).astype(np.intp)
+        minimum_indices = starts + minimum_offsets
+        maximum_indices = starts + maximum_offsets
+        ordered = np.empty(bucket_count * 2, dtype=np.intp)
+        ordered[0::2] = np.minimum(minimum_indices, maximum_indices)
+        ordered[1::2] = np.maximum(minimum_indices, maximum_indices)
+        return ordered[np.repeat(valid_buckets, 2)]
 
     def _update_signal_panel_metrics(
         self,
         panel: SignalPanel,
-        raw_values: np.ndarray,
-        normalized_values: np.ndarray,
+        values: np.ndarray,
     ) -> None:
         channel_name = self._selected_channel(panel)
         display = self._channel_display(channel_name)
-        finite = raw_values[np.isfinite(raw_values)]
+        finite = values[np.isfinite(values)]
         if not len(finite):
             panel.current.setText("--")
             panel.peak.setText("--")
-            panel.range_label.setText(f"자동 min–max · {display.label}: 데이터 없음")
+            panel.range_label.setText(f"Y축 자동 범위 · {display.label}: 데이터 없음")
             return
-        current = float(normalized_values[-1])
+        current = float(values[-1])
         peak = self._peak_values.get(channel_name, float(np.max(finite)))
-        panel.current.setText(self._format_normalized_value(current))
+        panel.current.setText(self._format_channel_value(current, display))
         panel.peak.setText(self._format_channel_value(peak, display))
-        minimum, maximum = self._channel_bounds.get(
-            channel_name, (float(np.min(finite)), float(np.max(finite)))
-        )
+        minimum, maximum = float(np.min(finite)), float(np.max(finite))
         panel.range_label.setText(
-            "자동 min–max · "
+            "Y축 자동 범위 · "
             f"{self._format_channel_value(minimum, display)} – "
             f"{self._format_channel_value(maximum, display)}"
         )
 
-    def _normalize_channel_values(
-        self, channel_name: str, values: np.ndarray
-    ) -> np.ndarray:
-        normalized = np.full(values.shape, np.nan, dtype=np.float32)
+    @staticmethod
+    def _autoscale_panel_y(panel: SignalPanel, values: np.ndarray) -> None:
+        """Fit the plot height to physical values without changing those values."""
         finite_mask = np.isfinite(values)
         if not np.any(finite_mask):
-            return normalized
-        minimum, maximum = self._channel_bounds.get(
-            channel_name,
-            (float(np.min(values[finite_mask])), float(np.max(values[finite_mask]))),
-        )
+            return
+        minimum = float(np.min(values[finite_mask]))
+        maximum = float(np.max(values[finite_mask]))
         span = maximum - minimum
         if np.isclose(span, 0.0):
-            normalized[finite_mask] = 0.5
-            return normalized
-        normalized[finite_mask] = np.clip(
-            (values[finite_mask] - minimum) / span,
-            0.0,
-            1.0,
-        )
-        return normalized
+            span = max(abs(minimum), 1.0) * 0.05
+        padding = span * 0.08
+        panel.plot.setYRange(minimum - padding, maximum + padding, padding=0.0)
 
     @staticmethod
     def _format_channel_value(value: float, display: ChannelDisplay) -> str:
@@ -456,20 +508,15 @@ class MainWindow(QMainWindow):
         suffix = f" {display.unit}" if display.unit else ""
         return f"{value:.{display.decimals}f}{suffix}"
 
-    @staticmethod
-    def _format_normalized_value(value: float) -> str:
-        if not np.isfinite(value):
-            return "--"
-        return f"{value:.{NORMALIZED_DECIMALS}f}"
-
     def _update_quick_settings_summary(self) -> None:
         if not hasattr(self, "quick_settings_summary"):
             return
         self.quick_settings_summary.setText(
             f"Pi {self.config.system.pi_host}:{self.config.ssh.port} · "
             f"DAQ {self.config.daq.sample_rate:,} S/s · "
-            f"AI{self.config.thrust.channel}=추력, AI{self.config.pressure.channel}=압력 · "
-            "표시: 세션 min–max 자동 정규화"
+            f"AI{self.config.thrust.channel}=로드셀, "
+            f"AI{self.config.pressure.channel}=두번째 센서 · "
+            "표시: 실제 물리량 · 그래프 Y축 자동 범위"
         )
 
     def _build_setup(self) -> QWidget:
@@ -486,12 +533,16 @@ class MainWindow(QMainWindow):
         self.nano_port = QLineEdit(self.config.nano.port)
         self.sample_rate_setup = self._spin(1, 47_619, self.config.daq.sample_rate)
         self.block_ms = self._spin(1, 1000, self.config.daq.block_ms)
-        self.thrust_channel = self._spin(0, 7, self.config.thrust.channel)
-        self.thrust_scale = self._double(self.config.thrust.scale)
-        self.thrust_offset = self._double(self.config.thrust.offset)
-        self.pressure_channel = self._spin(0, 7, self.config.pressure.channel)
-        self.pressure_scale = self._double(self.config.pressure.scale)
-        self.pressure_offset = self._double(self.config.pressure.offset)
+        self.thrust_channel = self._spin(
+            THRUST_AI_CHANNEL, THRUST_AI_CHANNEL, THRUST_AI_CHANNEL
+        )
+        self.thrust_channel.setEnabled(False)
+        self.pressure_channel = self._spin(
+            SECOND_SENSOR_AI_CHANNEL,
+            SECOND_SENSOR_AI_CHANNEL,
+            SECOND_SENSOR_AI_CHANNEL,
+        )
+        self.pressure_channel.setEnabled(False)
         self.log_directory = QLineEdit(str(self.config.logging.directory))
         if self.fixed_connection:
             for widget in (
@@ -503,10 +554,10 @@ class MainWindow(QMainWindow):
                 self.remember_password,
             ):
                 widget.setEnabled(False)
-        normalization = QLabel(
-            "세션 min–max 자동 정규화 (0–1) · 원본 범위는 그래프 하단에 표시"
+        display_scale = QLabel(
+            "실제 물리값·단위를 표시하고, 그래프 Y축 높이만 최근 데이터 min–max에 맞춥니다."
         )
-        normalization.setWordWrap(True)
+        display_scale.setWordWrap(True)
         fields = (
             ("Pi IP Address (고정)", self.pi_host),
             ("Telemetry Port (고정)", self.telemetry_port),
@@ -517,9 +568,9 @@ class MainWindow(QMainWindow):
             ("Nano Port", self.nano_port),
             ("Sample Rate", self.sample_rate_setup),
             ("Block ms", self.block_ms),
-            ("Thrust Channel", self.thrust_channel),
-            ("Pressure Channel", self.pressure_channel),
-            ("Display Scale", normalization),
+            ("AI0 (로드셀 · 고정)", self.thrust_channel),
+            ("AI1 (두번째 센서 · 고정)", self.pressure_channel),
+            ("Display Scale", display_scale),
             ("Log Directory", self.log_directory),
         )
         for label, widget in fields:
@@ -570,6 +621,9 @@ class MainWindow(QMainWindow):
         self._signals.error.connect(self._show_error)
         self._signals.session_started.connect(self._session_started)
         self._signals.session_stopped.connect(self._session_stopped)
+        self._signals.calibration_sampled.connect(self._calibration_sampled)
+        self._signals.calibration_saved.connect(self._calibration_saved)
+        self._signals.daq_reset_finished.connect(self._daq_reset_finished)
         self._signals.system_test_finished.connect(self._system_test_finished)
         self._signals.remote_log_downloaded.connect(self._remote_log_downloaded)
 
@@ -601,16 +655,115 @@ class MainWindow(QMainWindow):
         self.state_label.setText("STATUS: STOPPING")
         self._runtime.stop_session()
 
+    def _open_calibration(self) -> None:
+        if self._runtime is None:
+            QMessageBox.warning(
+                self, "연결 대기", "Pi telemetry 연결이 준비된 뒤 보정하십시오."
+            )
+            return
+        if self.stop_button.isEnabled():
+            QMessageBox.warning(
+                self, "측정 중", "측정을 종료한 뒤에만 실행 전 캘리브레이션을 할 수 있습니다."
+            )
+            return
+        dialog = LoadCellCalibrationDialog(
+            current_scale=self.config.thrust.scale,
+            current_offset=self.config.thrust.offset,
+            parent=self,
+        )
+        dialog.capture_requested.connect(self._capture_calibration_sample)
+        dialog.save_requested.connect(self._save_thrust_calibration)
+        self._calibration_dialog = dialog
+        dialog.exec()
+        self._calibration_dialog = None
+
+    def _reset_daq(self) -> None:
+        if self._runtime is None:
+            QMessageBox.warning(
+                self, "연결 대기", "Dashboard 백엔드가 준비된 뒤 DAQ를 초기화하십시오."
+            )
+            return
+        if self.stop_button.isEnabled():
+            QMessageBox.warning(
+                self, "측정 중", "측정을 종료한 뒤에만 DAQ 초기화를 실행할 수 있습니다."
+            )
+            return
+        self._daq_reset_in_progress = True
+        self._update_daq_reset_button()
+        self.start_button.setEnabled(False)
+        self.state_label.setText("STATUS: DAQ INITIALIZING")
+        self._append_log("DAQ 초기화: USB-4704 복구를 시작합니다.")
+        self._runtime.reset_daq()
+
+    def _daq_reset_finished(self, result: dict[str, object]) -> None:
+        self._daq_reset_in_progress = False
+        details = str(result.get("details", "")).strip()
+        if bool(result.get("daq_ready")):
+            self._append_log("DAQ 초기화 완료: /dev/daq0 준비됨. Pi 재연결 중입니다.")
+        else:
+            self._append_log(
+                "DAQ 초기화는 끝났지만 /dev/daq0이 없습니다. USB 전원·케이블을 확인하십시오."
+            )
+        if details:
+            self.pipeline_message.setText(f"DAQ 초기화: {details}")
+        self._update_daq_reset_button()
+
+    def _capture_calibration_sample(self, row: int, duration_ms: int) -> None:
+        if self._runtime is None:
+            if self._calibration_dialog is not None:
+                self._calibration_dialog.operation_failed("Pi telemetry 연결이 없습니다")
+            return
+        self._runtime.capture_calibration_sample(row=row, duration_ms=duration_ms)
+
+    def _calibration_sampled(self, result: dict[str, Any]) -> None:
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.record_capture(result)
+
+    def _save_thrust_calibration(
+        self, scale_N_per_count: float, offset_N: float
+    ) -> None:
+        if self._runtime is None:
+            if self._calibration_dialog is not None:
+                self._calibration_dialog.operation_failed("Pi telemetry 연결이 없습니다")
+            return
+        self._runtime.save_thrust_calibration(
+            scale_N_per_count=scale_N_per_count,
+            offset_N=offset_N,
+        )
+
+    def _calibration_saved(self, result: dict[str, Any]) -> None:
+        try:
+            thrust = result["thrust"]
+            updated = ChannelConfig(
+                channel=THRUST_AI_CHANNEL,
+                scale=float(thrust["scale"]),
+                offset=float(thrust["offset"]),
+            )
+            self.config = replace(self.config, thrust=updated)
+            save_config(self.config, self.config_path)
+            self._update_quick_settings_summary()
+        except (ConfigError, KeyError, TypeError, ValueError) as exc:
+            QMessageBox.warning(
+                self,
+                "로컬 설정 경고",
+                "Pi에는 보정값이 저장됐지만 노트북 설정 파일 반영에 실패했습니다: "
+                f"{exc}",
+            )
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.calibration_saved(result)
+
     def _session_started(self, result: dict[str, Any]) -> None:
         self._clear_graphs()
         self.state_label.setText("STATUS: RECORDING / ARMED")
         self.stop_button.setEnabled(True)
+        self._update_daq_reset_button()
         self._append_log(f"Session started: {result.get('log_file', '')}")
 
     def _session_stopped(self, result: dict[str, Any]) -> None:
         self.state_label.setText("STATUS: COMPLETE")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self._update_daq_reset_button()
         self._append_log(f"Session stopped: {result.get('log_file', '')}")
         self._refresh_logs()
 
@@ -655,13 +808,6 @@ class MainWindow(QMainWindow):
                     self._peak_values.get(channel_name, float("-inf")),
                     float(np.max(finite)),
                 )
-                minimum = float(np.min(finite))
-                maximum = float(np.max(finite))
-                previous_bounds = self._channel_bounds.get(channel_name)
-                if previous_bounds is not None:
-                    minimum = min(minimum, previous_bounds[0])
-                    maximum = max(maximum, previous_bounds[1])
-                self._channel_bounds[channel_name] = (minimum, maximum)
 
         max_points = max(block.sample_rate * 10, block.sample_count)
         if len(self._sample_indices) > max_points:
@@ -686,15 +832,10 @@ class MainWindow(QMainWindow):
         for panel in self._signal_panels:
             values = self._channel_values.get(self._selected_channel(panel))
             if values is not None:
-                channel_name = self._selected_channel(panel)
-                self._update_signal_panel_metrics(
-                    panel,
-                    values,
-                    self._normalize_channel_values(channel_name, values),
-                )
+                self._update_signal_panel_metrics(panel, values)
 
         now = time.monotonic()
-        if now - self._last_plot_update >= 0.05:
+        if now - self._last_plot_update >= PLOT_REFRESH_INTERVAL_SEC:
             self._render_signal_panels()
             self._last_plot_update = now
 
@@ -721,6 +862,7 @@ class MainWindow(QMainWindow):
         elif state in ("READY", "COMPLETE"):
             self.start_button.setEnabled(self._runtime is not None)
             self.stop_button.setEnabled(False)
+        self._update_daq_reset_button()
         self._update_pipeline_summary()
 
     def _connection_changed(self, component: str, status: str) -> None:
@@ -734,6 +876,7 @@ class MainWindow(QMainWindow):
         elif component == "Pi":
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
+        self._update_daq_reset_button()
         if component == "Trigger":
             self.state_label.setText(f"STATUS: TRIGGERED ({status})")
         self._append_log(f"{component}: {status}")
@@ -754,6 +897,16 @@ class MainWindow(QMainWindow):
             self.pipeline_summary.setText(
                 "SSH 터널과 Pi telemetry 연결을 기다리는 중입니다."
             )
+
+    def _update_daq_reset_button(self) -> None:
+        if not hasattr(self, "daq_reset_button"):
+            return
+        idle = not self.stop_button.isEnabled()
+        self.daq_reset_button.setEnabled(
+            self._runtime is not None
+            and idle
+            and not self._daq_reset_in_progress
+        )
 
     def _health_status(self, component: str, value: str) -> None:
         upper = value.upper()
@@ -813,14 +966,14 @@ class MainWindow(QMainWindow):
                     device=self.config.daq.device,
                 ),
                 thrust=ChannelConfig(
-                    self.thrust_channel.value(),
-                    self.thrust_scale.value(),
-                    self.thrust_offset.value(),
+                    THRUST_AI_CHANNEL,
+                    self.config.thrust.scale,
+                    self.config.thrust.offset,
                 ),
                 pressure=ChannelConfig(
-                    self.pressure_channel.value(),
-                    self.pressure_scale.value(),
-                    self.pressure_offset.value(),
+                    SECOND_SENSOR_AI_CHANNEL,
+                    self.config.pressure.scale,
+                    self.config.pressure.offset,
                 ),
                 logging=LoggingConfig(
                     directory=Path(self.log_directory.text()),
@@ -917,8 +1070,21 @@ class MainWindow(QMainWindow):
 
     def _show_error(self, message: str) -> None:
         self._append_log(f"ERROR: {message}")
+        if self._daq_reset_in_progress:
+            self._daq_reset_in_progress = False
+            self._update_daq_reset_button()
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.operation_failed(message)
+        if "DAQ 초기화" in message:
+            # A bounded Pi-side hardware operation has detected a wedged USB
+            # ioctl. Keep Start disabled so a late command cannot surprise the
+            # operator; the reset button remains available even if telemetry
+            # itself is no longer responsive.
+            self.state_label.setText("STATUS: DAQ RECOVERY REQUIRED")
+            self.start_button.setEnabled(False)
+            self._update_daq_reset_button()
         QMessageBox.critical(self, "TUSI TMS 오류", message)
-        if "Session" in message or "session" in message:
+        if "session" in message.lower() and "DAQ 초기화" not in message:
             self.start_button.setEnabled(True)
 
     def _append_log(self, message: str) -> None:
@@ -935,7 +1101,6 @@ class MainWindow(QMainWindow):
         }
         self._trigger_sample = None
         self._peak_values = {}
-        self._channel_bounds = {}
         self._last_plot_update = 0.0
         for panel in self._signal_panels:
             panel.curve.clear()

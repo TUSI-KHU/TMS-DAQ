@@ -1,7 +1,16 @@
 from dataclasses import replace
 from pathlib import Path
 
-from common.config import SshConfig, default_config, load_config, save_config
+import pytest
+
+from common.config import (
+    ChannelConfig,
+    ConfigError,
+    SshConfig,
+    default_config,
+    load_config,
+    save_config,
+)
 
 
 def test_example_configuration_loads() -> None:
@@ -36,7 +45,7 @@ def test_saved_configuration_omits_unremembered_password(tmp_path) -> None:
     saved = save_config(config, tmp_path / "config.yaml")
 
     text = saved.read_text(encoding="utf-8")
-    assert "pi_host: 192.168.0.214" in text
+    assert "pi_host: 10.47.0.2" in text
     assert "password: ''" in text or 'password: ""' in text
     assert "do-not-save-this" not in text
     assert "do-not-save-this" not in repr(config)
@@ -44,3 +53,11 @@ def test_saved_configuration_omits_unremembered_password(tmp_path) -> None:
     assert reloaded.thrust == config.thrust
     assert reloaded.pressure == config.pressure
     assert reloaded.ssh.password == ""
+
+
+def test_field_channel_mapping_is_fixed_to_ai0_and_ai1() -> None:
+    config = default_config()
+    with pytest.raises(ConfigError, match="thrust/load-cell is fixed to AI0"):
+        replace(config, thrust=ChannelConfig(channel=2, scale=1.0, offset=0.0))
+    with pytest.raises(ConfigError, match="second sensor is fixed to AI1"):
+        replace(config, pressure=ChannelConfig(channel=2, scale=1.0, offset=0.0))

@@ -6,13 +6,15 @@ import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
-from common.config import ConfigError, TmsConfig, load_config
+import numpy as np
+
+from common.config import ChannelConfig, ConfigError, TmsConfig, load_config
 from pi.daq import (
     DaqBlock,
     DaqError,
@@ -185,6 +187,125 @@ class TmsAgent:
             },
         }
 
+    def capture_calibration_sample(
+        self,
+        *,
+        duration_sec: float = 1.0,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Capture a short, non-recording raw AI0/AI1 reference reading.
+
+        This deliberately opens the same buffered USB-4704 path used for a
+        session, but it does not arm Nano, create an HDF5 file, or publish an
+        acquisition session.  It is therefore safe to use from the dashboard
+        before a test while the agent is idle.
+        """
+
+        if self.state not in (AgentState.READY, AgentState.COMPLETE):
+            raise SessionError(
+                "calibration sampling is only available before a measurement session"
+            )
+        if not 0.1 <= duration_sec <= 10.0:
+            raise SessionError("calibration duration must be between 0.1 and 10 seconds")
+        if cancel_event is not None and cancel_event.is_set():
+            raise SessionError("calibration capture was cancelled before it started")
+
+        original_state = self.state
+        started = False
+        captured: dict[int, list[np.ndarray]] = {
+            self.config.thrust.channel: [],
+            self.config.pressure.channel: [],
+        }
+        started_at = time.monotonic()
+        deadline = started_at + duration_sec
+        self.health["daq"] = "CALIBRATING"
+        try:
+            self.daq.start()
+            started = True
+            while time.monotonic() < deadline or not captured[self.config.thrust.channel]:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise SessionError("calibration capture was cancelled")
+                block = self.daq.read_block()
+                for channel in captured:
+                    captured[channel].append(
+                        np.asarray(block.column_for_channel(channel), dtype=np.float64)
+                    )
+            if cancel_event is not None and cancel_event.is_set():
+                raise SessionError("calibration capture was cancelled")
+        except SessionError:
+            # A timed-out remote command may still return from a blocked USB
+            # ioctl later. Never publish that stale capture as a valid
+            # calibration result; the dashboard must run DAQ recovery first.
+            self.health["daq"] = "FAILED"
+            self._daq_probe["available"] = False
+            self._daq_probe["reason"] = "calibration operation was cancelled"
+            raise
+        except (DaqError, DaqStopped, OSError, ValueError) as exc:
+            self.health["daq"] = "FAILED"
+            self._daq_probe["available"] = False
+            self._daq_probe["reason"] = str(exc)
+            raise DaqError(f"calibration capture failed: {exc}") from exc
+        finally:
+            if started:
+                self.daq.stop()
+                self.daq.close()
+            self.state = original_state
+
+        summaries: dict[str, dict[str, float | int]] = {}
+        for name, channel in (
+            ("ai0", self.config.thrust.channel),
+            ("ai1", self.config.pressure.channel),
+        ):
+            values = np.concatenate(captured[channel])
+            summaries[name] = {
+                "sample_count": int(values.size),
+                "mean": float(np.mean(values)),
+                "stddev": float(np.std(values)),
+                "minimum": float(np.min(values)),
+                "maximum": float(np.max(values)),
+            }
+
+        self.health["daq"] = "READY"
+        self._daq_probe["available"] = True
+        self._daq_probe["reason"] = ""
+        return {
+            "duration_ms": int(round((time.monotonic() - started_at) * 1000.0)),
+            "channels": summaries,
+        }
+
+    def updated_thrust_calibration(
+        self, *, scale_N_per_count: float, offset_N: float
+    ) -> TmsConfig:
+        """Build a validation-backed config for a new fixed-AI0 calibration."""
+
+        return replace(
+            self.config,
+            thrust=ChannelConfig(
+                channel=self.config.thrust.channel,
+                scale=scale_N_per_count,
+                offset=offset_N,
+            ),
+        )
+
+    def apply_idle_config(self, config: TmsConfig) -> None:
+        """Install a persisted calibration for the next session while idle."""
+
+        if self.state not in (AgentState.READY, AgentState.COMPLETE):
+            raise SessionError("calibration cannot change while a session is active")
+        if (
+            config.system != self.config.system
+            or config.ssh != self.config.ssh
+            or config.nano != self.config.nano
+            or config.daq != self.config.daq
+            or config.pressure != self.config.pressure
+            or config.logging != self.config.logging
+        ):
+            raise SessionError("only the fixed AI0 load-cell calibration may change")
+        self.config = config
+        # The logger writes the effective calibration into every subsequent
+        # HDF5 session's metadata, so rebuild it before the next start.
+        self._logger = Hdf5SessionLogger(config, self._output_directory)
+
     def add_telemetry_subscriber(
         self, *, max_blocks: int = 100
     ) -> queue.Queue[DaqBlock]:
@@ -199,9 +320,13 @@ class TmsAgent:
         with self._telemetry_lock:
             self._telemetry_queues.discard(subscriber)
 
-    def start_session(self, test_name: str) -> Path:
+    def start_session(
+        self, test_name: str, *, cancel_event: threading.Event | None = None
+    ) -> Path:
         if self.state not in (AgentState.READY, AgentState.COMPLETE):
             raise SessionError(f"cannot start a session while state is {self.state}")
+        if cancel_event is not None and cancel_event.is_set():
+            raise SessionError("session start was cancelled before it started")
 
         self._stop_event.clear()
         self._failures.clear()
@@ -227,6 +352,22 @@ class TmsAgent:
 
         try:
             self.daq.start()
+            if cancel_event is not None and cancel_event.is_set():
+                self.daq.stop()
+                self.daq.close()
+                self._session_id = None
+                raise SessionError("session start was cancelled")
+        except SessionError:
+            # The command watchdog may have returned an error to the
+            # dashboard while a driver ioctl was still pending. If it later
+            # unblocks, close the just-opened logger instead of silently
+            # beginning an unexpected measurement session.
+            self.health["daq"] = "FAILED"
+            self._daq_probe["available"] = False
+            self._daq_probe["reason"] = "session start operation was cancelled"
+            self._logger.close()
+            self._session_id = None
+            raise
         except BaseException as exc:
             self.health["daq"] = "FAILED"
             self._daq_probe["available"] = False

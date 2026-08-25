@@ -24,6 +24,10 @@ class SshConnectionError(RuntimeError):
         super().__init__(message)
 
 
+class SshCommandError(RuntimeError):
+    """Raised when an authenticated Pi maintenance command fails."""
+
+
 StatusCallback = Callable[[str], None]
 
 
@@ -60,38 +64,16 @@ class SshTunnelManager:
         await self.disconnect()
         self._status("CONNECTING")
         try:
-            self._connection = await asyncssh.connect(
-                self.system.pi_host,
-                port=self.ssh.port,
-                username=self.ssh.username,
-                password=self.ssh.password,
-                client_keys=[],
-                agent_path=None,
-                preferred_auth=("password", "keyboard-interactive"),
-                known_hosts=None,
-                config=None,
-                connect_timeout=self.ssh.connect_timeout_sec,
-                login_timeout=self.ssh.connect_timeout_sec,
-                keepalive_interval=self.ssh.keepalive_interval_sec,
-                keepalive_count_max=3,
+            self._connection = await self._open_ssh_connection()
+        except SshConnectionError as exc:
+            self._status(
+                "AUTHENTICATION_FAILED"
+                if exc.kind == SshFailureKind.AUTHENTICATION
+                else "TIMEOUT"
+                if exc.kind == SshFailureKind.TIMEOUT
+                else "DISCONNECTED"
             )
-        except asyncssh.PermissionDenied as exc:
-            self._status("AUTHENTICATION_FAILED")
-            raise SshConnectionError(
-                SshFailureKind.AUTHENTICATION,
-                "SSH ID 또는 Password를 확인하십시오.",
-            ) from exc
-        except (asyncio.TimeoutError, TimeoutError) as exc:
-            self._status("TIMEOUT")
-            raise SshConnectionError(
-                SshFailureKind.TIMEOUT, "Raspberry Pi SSH 연결 시간이 초과되었습니다."
-            ) from exc
-        except (OSError, asyncssh.Error) as exc:
-            self._status("DISCONNECTED")
-            raise SshConnectionError(
-                SshFailureKind.NETWORK,
-                "Raspberry Pi에 SSH로 연결할 수 없습니다.",
-            ) from exc
+            raise
 
         try:
             self._listener = await self._connection.forward_local_port(
@@ -122,6 +104,84 @@ class SshTunnelManager:
             await self._connection.wait_closed()
         self._connection = None
         self._status("DISCONNECTED")
+
+    async def recover_usb4704(self, *, timeout: float = 90.0) -> dict[str, object]:
+        """Run the fixed root-only USB-4704 recovery helper over a new SSH channel.
+
+        The normal telemetry tunnel is intentionally not reused: restarting
+        tms-agent closes that local telemetry socket, while this independent
+        SSH command must remain alive long enough to report whether daq0 came
+        back. The password travels on stdin to sudo, never in the command line.
+        """
+
+        if not self.ssh.password:
+            raise SshCommandError("DAQ 초기화에는 SSH/sudo 비밀번호가 필요합니다.")
+        connection = await self._open_ssh_connection()
+        try:
+            result = await connection.run(
+                "sudo -S -p '' /opt/tusi-tms/bin/recover-usb4704.sh /dev/daq0",
+                input=f"{self.ssh.password}\n",
+                check=False,
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise SshCommandError(
+                "DAQ 초기화가 90초 안에 끝나지 않았습니다. USB 전원/케이블을 확인하십시오."
+            ) from exc
+        except (OSError, asyncssh.Error) as exc:
+            raise SshCommandError(f"Pi에서 DAQ 초기화 명령을 실행할 수 없습니다: {exc}") from exc
+        finally:
+            connection.close()
+            await connection.wait_closed()
+
+        details = "\n".join(
+            text.strip()
+            for text in (str(result.stdout or ""), str(result.stderr or ""))
+            if text and text.strip()
+        )
+        if result.exit_status == 0:
+            return {"daq_ready": True, "details": details or "DAQ_READY"}
+        if result.exit_status == 3:
+            return {
+                "daq_ready": False,
+                "details": details or "/dev/daq0 is still missing after recovery",
+            }
+        raise SshCommandError(
+            "DAQ 초기화 명령이 실패했습니다"
+            + (f": {details}" if details else f" (exit {result.exit_status})")
+        )
+
+    async def _open_ssh_connection(self) -> asyncssh.SSHClientConnection:
+        try:
+            return await asyncssh.connect(
+                self.system.pi_host,
+                port=self.ssh.port,
+                username=self.ssh.username,
+                password=self.ssh.password,
+                client_keys=[],
+                agent_path=None,
+                preferred_auth=("password", "keyboard-interactive"),
+                known_hosts=None,
+                config=None,
+                connect_timeout=self.ssh.connect_timeout_sec,
+                login_timeout=self.ssh.connect_timeout_sec,
+                keepalive_interval=self.ssh.keepalive_interval_sec,
+                keepalive_count_max=3,
+            )
+        except asyncssh.PermissionDenied as exc:
+            raise SshConnectionError(
+                SshFailureKind.AUTHENTICATION,
+                "SSH ID 또는 Password를 확인하십시오.",
+            ) from exc
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise SshConnectionError(
+                SshFailureKind.TIMEOUT, "Raspberry Pi SSH 연결 시간이 초과되었습니다."
+            ) from exc
+        except (OSError, asyncssh.Error) as exc:
+            raise SshConnectionError(
+                SshFailureKind.NETWORK,
+                "Raspberry Pi에 SSH로 연결할 수 없습니다.",
+            ) from exc
 
     async def reconnect_until(
         self,

@@ -1,5 +1,5 @@
 system:
-  pi_host: 192.168.0.214
+  pi_host: 10.47.0.2
   telemetry_port: 29100
 
 ssh:

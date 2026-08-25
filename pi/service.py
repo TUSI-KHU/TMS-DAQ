@@ -5,7 +5,7 @@ import asyncio
 import signal
 from pathlib import Path
 
-from common.config import ConfigError, load_config
+from common.config import ConfigError, load_config, save_config
 from pi.daq import DaqError, SimulatedDaqSource, Usb4704DaqSource
 from pi.telemetry import TelemetryServer
 from pi.tms_agent import AgentState, SessionError, TmsAgent
@@ -45,11 +45,16 @@ async def run_service(args: argparse.Namespace) -> None:
         output_directory = args.log_dir or config.logging.pi_directory
 
     agent = TmsAgent(config, daq, output_directory=output_directory)
+
+    def persist_config(updated_config) -> None:
+        save_config(updated_config, config_path)
+
     server = TelemetryServer(
         agent,
         config,
         host=args.bind,
         port=args.port if args.port is not None else config.system.telemetry_port,
+        config_update_callback=persist_config,
     )
     await server.start()
     print(f"tms-agent READY on {args.bind}:{server.port}")

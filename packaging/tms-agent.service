@@ -16,12 +16,15 @@ ExecStartPre=+/opt/tusi-tms/bin/reset-usb4704-on-start.sh /dev/daq0
 ExecStart=/opt/tusi-tms/.venv/bin/tms-agent --config /etc/tusi-tms/config.yaml
 Restart=on-failure
 RestartSec=2
+TimeoutStartSec=90
 TimeoutStopSec=15
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/tusi-tms
+# The dashboard persists only the fitted AI0 scale/offset here through the
+# local-only telemetry service; all other system paths remain read-only.
+ReadWritePaths=/var/lib/tusi-tms /etc/tusi-tms
 
 [Install]
 WantedBy=multi-user.target

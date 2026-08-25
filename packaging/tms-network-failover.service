@@ -1,0 +1,13 @@
+[Unit]
+Description=TUSI Ethernet to Wi-Fi reachability failover
+Wants=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/opt/tusi-tms/bin/tms-network-failover.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

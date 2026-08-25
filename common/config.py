@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 
-# Closed, wired field network endpoint.  These values intentionally live in
-# source: the deployment has a fixed Pi and the operator does not configure
-# connection details in the Dashboard.
-TMS_PI_HOST = "192.168.0.214"
+# Closed, wired field network endpoint.  The dedicated DAQ cable lives on a
+# private subnet so it can never compete with the operator's 192.168.0.0/24
+# router Wi-Fi route.
+TMS_PI_HOST = "10.47.0.2"
 TMS_TELEMETRY_PORT = 29100
 TMS_SSH_PORT = 22
 TMS_SSH_USERNAME = "tms"
 TMS_SSH_PASSWORD = "tms"
+
+# This field installation is deliberately wired as a two-channel system.
+# Keeping the mapping in one place prevents an accidental Setup edit from
+# applying a load-cell calibration to a different physical AI terminal.
+THRUST_AI_CHANNEL = 0
+SECOND_SENSOR_AI_CHANNEL = 1
 
 
 class ConfigError(ValueError):
@@ -76,6 +83,8 @@ class ChannelConfig:
     def __post_init__(self) -> None:
         if self.channel < 0:
             raise ConfigError("channel must be zero or greater")
+        if not isfinite(self.scale) or not isfinite(self.offset):
+            raise ConfigError("channel scale and offset must be finite")
 
 
 @dataclass(frozen=True)
@@ -124,11 +133,15 @@ class TmsConfig:
     nano: NanoConfig = field(default_factory=NanoConfig)
 
     def __post_init__(self) -> None:
-        if self.thrust.channel == self.pressure.channel:
-            raise ConfigError("thrust and pressure must use different DAQ channels")
-        if self.thrust.channel > 7 or self.pressure.channel > 7:
-            raise ConfigError("USB-4704 channel numbers must be between 0 and 7")
-        scan_channel_count = abs(self.thrust.channel - self.pressure.channel) + 1
+        if self.thrust.channel != THRUST_AI_CHANNEL:
+            raise ConfigError(
+                f"thrust/load-cell is fixed to AI{THRUST_AI_CHANNEL}"
+            )
+        if self.pressure.channel != SECOND_SENSOR_AI_CHANNEL:
+            raise ConfigError(
+                f"second sensor is fixed to AI{SECOND_SENSOR_AI_CHANNEL}"
+            )
+        scan_channel_count = SECOND_SENSOR_AI_CHANNEL - THRUST_AI_CHANNEL + 1
         if self.daq.sample_rate * scan_channel_count > 47_619:
             raise ConfigError(
                 "DAQ sample rate multiplied by the contiguous channel scan count "
@@ -162,8 +175,10 @@ def default_config() -> TmsConfig:
         ssh=SshConfig(),
         nano=NanoConfig(),
         daq=DaqConfig(),
-        thrust=ChannelConfig(channel=0, scale=0.01, offset=0.0),
-        pressure=ChannelConfig(channel=1, scale=0.001, offset=0.0),
+        thrust=ChannelConfig(channel=THRUST_AI_CHANNEL, scale=0.01, offset=0.0),
+        pressure=ChannelConfig(
+            channel=SECOND_SENSOR_AI_CHANNEL, scale=0.001, offset=0.0
+        ),
         logging=LoggingConfig(),
     )
 
@@ -201,12 +216,12 @@ def load_config(path: str | Path) -> TmsConfig:
                 device=str(daq.get("device", "/dev/daq0")),
             ),
             thrust=ChannelConfig(
-                channel=int(thrust.get("channel", 0)),
+                channel=int(thrust.get("channel", THRUST_AI_CHANNEL)),
                 scale=float(thrust.get("scale", 1.0)),
                 offset=float(thrust.get("offset", 0.0)),
             ),
             pressure=ChannelConfig(
-                channel=int(pressure.get("channel", 1)),
+                channel=int(pressure.get("channel", SECOND_SENSOR_AI_CHANNEL)),
                 scale=float(pressure.get("scale", 1.0)),
                 offset=float(pressure.get("offset", 0.0)),
             ),

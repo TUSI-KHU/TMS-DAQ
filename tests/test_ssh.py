@@ -40,6 +40,25 @@ class FakeConnection:
         return None
 
 
+class FakeRecoveryConnection(FakeConnection):
+    def __init__(self, *, exit_status: int, stdout: str = "", stderr: str = "") -> None:
+        super().__init__()
+        self.exit_status = exit_status
+        self.stdout = stdout
+        self.stderr = stderr
+        self.command = ""
+        self.input = ""
+
+    async def run(self, command, **kwargs):
+        self.command = command
+        self.input = kwargs.get("input", "")
+        return SimpleNamespace(
+            exit_status=self.exit_status,
+            stdout=self.stdout,
+            stderr=self.stderr,
+        )
+
+
 def test_ssh_uses_password_only_and_local_forward(monkeypatch) -> None:
     async def scenario() -> None:
         captured = {}
@@ -106,5 +125,50 @@ def test_remote_logs_are_sorted_by_modification_time() -> None:
             "2026_old.h5",
             "2026_new.h5",
         ]
+
+    asyncio.run(scenario())
+
+
+def test_usb4704_recovery_uses_a_separate_sudo_ssh_command(monkeypatch) -> None:
+    async def scenario() -> None:
+        connection = FakeRecoveryConnection(
+            exit_status=0, stderr="usb4704-recovery: RECOVERY_RESULT=DAQ_READY\n"
+        )
+
+        async def fake_connect(*_args, **_kwargs):
+            return connection
+
+        monkeypatch.setattr(asyncssh, "connect", fake_connect)
+        manager = SshTunnelManager(
+            SystemConfig("10.47.0.2", 29100),
+            SshConfig(username="tms", password="secret"),
+        )
+
+        result = await manager.recover_usb4704()
+
+        assert result["daq_ready"] is True
+        assert connection.command == (
+            "sudo -S -p '' /opt/tusi-tms/bin/recover-usb4704.sh /dev/daq0"
+        )
+        assert connection.input == "secret\n"
+        assert connection.closed
+
+    asyncio.run(scenario())
+
+
+def test_usb4704_recovery_reports_when_daq_node_stays_missing(monkeypatch) -> None:
+    async def scenario() -> None:
+        connection = FakeRecoveryConnection(
+            exit_status=3, stderr="usb4704-recovery: RECOVERY_RESULT=DAQ_MISSING\n"
+        )
+
+        async def fake_connect(*_args, **_kwargs):
+            return connection
+
+        monkeypatch.setattr(asyncssh, "connect", fake_connect)
+        result = await SshTunnelManager(SystemConfig(), SshConfig()).recover_usb4704()
+
+        assert result["daq_ready"] is False
+        assert "DAQ_MISSING" in str(result["details"])
 
     asyncio.run(scenario())

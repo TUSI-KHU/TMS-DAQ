@@ -52,9 +52,12 @@ Dashboard가 password SSH 인증, local tunnel, Nano Serial 및 Pi telemetry를
 ./scripts/run-tms-dashboard.sh
 ```
 
-실행 스크립트가 노트북 유선 NIC를 `192.168.0.213`, Pi `eth0`을
-`192.168.0.214`로 설정하고 Pi Wi-Fi를 끈 뒤 `tms-agent`를 재시작한다.
-접속 정보는 폐쇄망 고정값 `tms@192.168.0.214:22`이며, GUI가 Pi의
+실행 스크립트가 노트북 유선 NIC를 `10.47.0.1`, Pi `eth0`을
+`10.47.0.2`로 설정하고 `tms-agent`가 실행 중인지 확인한다. 정상 실행 중인
+agent는 재시작하지 않는다. Pi는 유선 링크가
+살아 있는 동안 Wi-Fi를 내려 동일 IP 충돌을 막고, 케이블이 빠지면 저장된
+`TUSI_wifi` 프로필로 자동 복귀한다.
+접속 정보는 폐쇄망 고정값 `tms@10.47.0.2:22`이며, GUI가 Pi의
 `tms-agent`에 SSH local tunnel로 연결한다. `--direct-telemetry`는 현장
 운용에 사용하지 않는다.
 
@@ -80,7 +83,7 @@ Dashboard가 password SSH 인증, local tunnel, Nano Serial 및 Pi telemetry를
 
 ### 2026-08-25 실장비 검증 결과
 
-Pi (`192.168.0.214`, Ubuntu 22.04 ARM64, `5.15.0-1105-raspi`)에서 다음을
+Pi (`10.47.0.2`, Ubuntu 22.04 ARM64, `5.15.0-1105-raspi`)에서 다음을
 실제 장치로 확인했다.
 
 - `bio4704`/`biokernbase` 모듈 적재, USB `1809:4704`, `/dev/daq0` 및
@@ -154,7 +157,7 @@ tms-agent-selftest \
 ```bash
 sudo adduser tms
 sudo apt update
-sudo apt install python3-venv python3-numpy python3-h5py python3-serial python3-yaml
+sudo apt install build-essential python3-venv python3-numpy python3-h5py python3-serial python3-yaml
 sudo ./scripts/install-tms-agent.sh
 systemctl status tms-agent.service
 ```
@@ -162,11 +165,22 @@ systemctl status tms-agent.service
 Pi telemetry server는 `127.0.0.1:29100`에만 bind되며 Dashboard가 SSH local
 forwarding으로 접근한다.
 
-`tms-agent`가 시작 또는 재시작될 때는 systemd의 root 전용 pre-start 단계가
-USB vendor/product `1809:4704`만 USB core에서 unbind/bind하여 1회 초기화한다.
-이는 AI 수집 장치의 기본 시작 동작이다. `/dev/daq0`가 다시 생기지 않아도
-서비스는 telemetry 진단을 제공하도록 계속 기동되며, 원인은 Dashboard 상태
-패널과 `journalctl -u tms-agent`에서 확인할 수 있다.
+`tms-agent`가 시작 또는 재시작될 때 `/dev/daq0`가 이미 있으면 systemd의
+root 전용 pre-start 단계는 USB topology를 건드리지 않는다. 장치 노드가 없을
+때만 USB `1809:4704`의 logical reauthorize를 먼저 시도하고, 실패했을 때만
+USB core rebind를 마지막 수단으로 사용한다. `usbreset`은 이 장치의 실패한
+control transfer를 장시간 block할 수 있어 사용하지 않는다.
+
+Dashboard의 **DAQ 초기화** 버튼은 telemetry `PING`에 의존하지 않는 별도 SSH
+복구 경로다. agent를 정지한 뒤 USB-4704의 상위 허브 포트를 전원 재인가하여
+물리 재연결과 같은 재열거를 수행하고 agent를 다시 시작한다. 배포 Pi의 VIA
+허브는 ganged power이므로 같은 허브의 다른 downstream USB 장치도 잠깐
+재시작될 수 있다.
+
+USB-4704는 USB bus-powered, 최대 500 mA 장치다. Pi kernel에
+`Undervoltage detected`가 기록되면 소프트웨어 복구만으로는 안정성을 보장할 수
+없다. 정격 Raspberry Pi 전원(5 V/3 A 이상)과 짧고 굵은 케이블을 사용하고,
+전압 경고가 재발하면 USB-4704를 외부 전원형 USB hub에 연결한 뒤 재시험한다.
 
 ## Dashboard 패키징
 

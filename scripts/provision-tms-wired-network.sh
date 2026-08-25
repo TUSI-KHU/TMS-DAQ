@@ -2,14 +2,15 @@
 # Provision the fixed point-to-point TUSI wired link before the Dashboard runs.
 set -euo pipefail
 
-readonly PI_IP=${TMS_PI_IP:-192.168.0.214}
-readonly LAPTOP_IP=${TMS_LAPTOP_IP:-192.168.0.213}
+readonly PI_IP=${TMS_PI_IP:-10.47.0.2}
+readonly LAPTOP_IP=${TMS_LAPTOP_IP:-10.47.0.1}
 readonly CIDR_PREFIX=24
 readonly SSH_USER=tms
 readonly SSH_PASSWORD=tms
 readonly SSH_PORT=22
 readonly LAPTOP_PROFILE=TUSI-DAQ-Wired
 readonly PI_PROFILE=TUSI-DAQ-Wired
+readonly PI_WIFI_PROFILE=${TMS_PI_WIFI_PROFILE:-TUSI_wifi}
 
 nmcli_bin=${NMCLI_BIN:-nmcli}
 ssh_bin=${SSH_BIN:-ssh}
@@ -28,10 +29,12 @@ usage() {
     cat <<'EOF'
 Usage: provision-tms-wired-network.sh
 
-Configures the laptop Ethernet link as 192.168.0.213/24, provisions the Pi
-Ethernet link as 192.168.0.214/24, makes a host route for the Pi over the
-wired cable, and restarts tms-agent. Override the local interface only with
-TMS_ETH_IFACE=<interface> when more than one cable is connected.
+Configures the laptop Ethernet link as 10.47.0.1/24, provisions the Pi
+Ethernet link as 10.47.0.2/24, makes a host route for the Pi over the
+wired cable, arms the Pi Ethernet-to-Wi-Fi fallback, and ensures tms-agent
+is active without resetting a healthy USB-4704.
+Override the local interface only with TMS_ETH_IFACE=<interface> when more
+than one cable is connected.
 EOF
 }
 
@@ -114,7 +117,7 @@ remote_direct_sudo() {
 }
 
 remote_configure_ethernet() {
-    remote_sudo "
+    remote_direct_sudo "
 set -euo pipefail
 profile='$PI_PROFILE'
 if ! nmcli -g NAME connection show | grep -Fxq \"\$profile\"; then
@@ -130,7 +133,11 @@ nmcli connection modify \"\$profile\" \\
     ipv4.route-metric 700 \\
     ipv4.routes '' \\
     ipv6.method disabled
-nmcli connection up \"\$profile\" ifname eth0
+current_connection=\$(nmcli -g GENERAL.CONNECTION device show eth0 || true)
+current_address=\$(ip -4 -o addr show dev eth0 | awk '{print \$4}' | grep -Fx '$PI_IP/$CIDR_PREFIX' || true)
+if [[ \"\$current_connection\" != \"\$profile\" || -z \"\$current_address\" ]]; then
+    nmcli connection up \"\$profile\" ifname eth0
+fi
 "
 }
 
@@ -142,16 +149,33 @@ add_pi_host_route() {
     ip route get "$PI_IP" | grep -Fq "dev $interface" || die "Pi route did not select $interface"
 }
 
-disable_pi_wifi_and_restart_agent() {
+wait_for_direct_ssh() {
+    local attempts=0
+    local maximum_attempts=15
+    while (( attempts < maximum_attempts )); do
+        if remote_direct_sudo "true" >/dev/null 2>&1; then
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+    die "Pi wired SSH is unreachable on ${PI_IP}; check the Ethernet cable and Pi eth0"
+}
+
+arm_pi_wifi_fallback_and_ensure_agent() {
     remote_direct_sudo "
 set -euo pipefail
-while IFS=: read -r name type; do
-    if [[ \"\$type\" == 802-11-wireless ]]; then
-        nmcli connection modify \"\$name\" connection.autoconnect no
-    fi
-done < <(nmcli -t -f NAME,TYPE connection show --active)
-nmcli radio wifi off
-systemctl restart tms-agent.service
+wifi_profile='$PI_WIFI_PROFILE'
+if nmcli -g NAME connection show | grep -Fxq \"\$wifi_profile\"; then
+    nmcli connection modify \"\$wifi_profile\" \\
+        connection.autoconnect yes \\
+        connection.autoconnect-priority 50
+fi
+systemctl enable --now tms-network-failover.service
+# Networking changes do not require restarting the loopback-only agent.
+# Restarting it on every dashboard launch ran the USB reset hook repeatedly,
+# including while a previously healthy USB-4704 was still enumerated.
+systemctl enable --now tms-agent.service
 systemctl is-active --quiet tms-agent.service
 "
 }
@@ -160,19 +184,18 @@ interface=$(find_ethernet_interface)
 log "configuring laptop $interface as $LAPTOP_IP/$CIDR_PREFIX"
 configure_laptop "$interface"
 
-# With the Ethernet route metric deliberately higher than Wi-Fi, this first
-# SSH connection still reaches the Pi over its existing management link.
-log "configuring Pi eth0 as $PI_IP/$CIDR_PREFIX"
-remote_configure_ethernet
-
+# The dashboard target is on a dedicated 10.47.0.0/24 subnet.  Keep an
+# explicit /32 route as a guard against any future overlapping host route.
 log "routing $PI_IP over $interface"
 add_pi_host_route "$interface"
 
-if [[ ${TMS_KEEP_PI_WIFI:-0} != 1 ]]; then
-    log "verifying direct link, disabling Pi Wi-Fi, and restarting tms-agent"
-    disable_pi_wifi_and_restart_agent
-else
-    log "direct link is ready; Pi Wi-Fi retained by TMS_KEEP_PI_WIFI=1"
-fi
+log "waiting for direct Pi SSH over $interface"
+wait_for_direct_ssh
+
+log "configuring Pi eth0 as $PI_IP/$CIDR_PREFIX"
+remote_configure_ethernet
+
+log "arming Pi Wi-Fi fallback and ensuring tms-agent is active over the direct link"
+arm_pi_wifi_fallback_and_ensure_agent
 
 log "ready: $LAPTOP_IP -> $PI_IP via $interface"

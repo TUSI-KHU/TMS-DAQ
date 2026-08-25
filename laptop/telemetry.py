@@ -145,6 +145,34 @@ class TelemetryClient:
     async def get_config(self, timeout: float = 5.0) -> dict[str, Any]:
         return (await self._request(MessageType.CONFIG, timeout=timeout)).body
 
+    async def capture_calibration_sample(
+        self, duration_ms: int = 1000
+    ) -> dict[str, Any]:
+        if not 100 <= duration_ms <= 10_000:
+            raise TelemetryError("calibration duration must be between 100 and 10000 ms")
+        timeout = duration_ms / 1000.0 + 10.0
+        return (
+            await self._request(
+                MessageType.CALIBRATION_SAMPLE,
+                {"duration_ms": duration_ms},
+                timeout=timeout,
+            )
+        ).body
+
+    async def set_thrust_calibration(
+        self, *, scale_N_per_count: float, offset_N: float, timeout: float = 10.0
+    ) -> dict[str, Any]:
+        return (
+            await self._request(
+                MessageType.SET_THRUST_CALIBRATION,
+                {
+                    "scale_N_per_count": scale_N_per_count,
+                    "offset_N": offset_N,
+                },
+                timeout=timeout,
+            )
+        ).body
+
     async def start_session(
         self, test_name: str, timeout: float = 10.0
     ) -> dict[str, Any]:

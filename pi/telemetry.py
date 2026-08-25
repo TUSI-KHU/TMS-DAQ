@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import queue
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -18,6 +23,20 @@ from common.protocol import (
 )
 from pi.daq import DaqBlock, DaqError
 from pi.tms_agent import SessionError, TmsAgent
+
+ConfigUpdateCallback = Callable[[TmsConfig], None]
+
+# The Pi still acquires and writes every 10 ms DAQ block.  Dashboard telemetry
+# is intentionally batched to a human-useful 20 Hz, reducing SSH framing,
+# physical-unit conversions, and GUI cross-thread events without losing a
+# sample in the HDF5 acquisition log.
+TELEMETRY_BATCH_INTERVAL_SEC = 0.05
+IDLE_STREAM_POLL_INTERVAL_SEC = 0.01
+# Driver setup normally completes in milliseconds. Keep a bounded margin so a
+# stuck kernel ioctl returns a useful recovery-required error before the
+# dashboard's own request timeout, instead of later starting a stale session.
+START_SESSION_OPERATION_TIMEOUT_SEC = 8.0
+CALIBRATION_OPERATION_GRACE_SEC = 5.0
 
 
 @dataclass(eq=False)
@@ -46,15 +65,18 @@ class TelemetryServer:
         host: str = "127.0.0.1",
         port: int | None = None,
         health_interval_sec: float = 0.5,
+        config_update_callback: ConfigUpdateCallback | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
         self.host = host
         self.requested_port = port if port is not None else config.system.telemetry_port
         self.health_interval_sec = health_interval_sec
+        self._config_update_callback = config_update_callback
         self._server: asyncio.AbstractServer | None = None
         self._clients: set[_Client] = set()
         self._command_lock = asyncio.Lock()
+        self._hardware_recovery_required: str | None = None
 
     @property
     def port(self) -> int:
@@ -163,7 +185,12 @@ class TelemetryServer:
                     test_name = str(message.body.get("test_name", "")).strip()
                     if not test_name:
                         raise SessionError("START_SESSION requires test_name")
-                    path = await asyncio.to_thread(self.agent.start_session, test_name)
+                    path = await self._run_bounded_hardware_command(
+                        MessageType.START_SESSION.value,
+                        self.agent.start_session,
+                        test_name,
+                        timeout=START_SESSION_OPERATION_TIMEOUT_SEC,
+                    )
                     await client.send(
                         WireMessage(
                             MessageType.ACK,
@@ -200,11 +227,65 @@ class TelemetryServer:
                             request_id=request_id,
                         )
                     )
+                elif message.message_type == MessageType.CALIBRATION_SAMPLE:
+                    duration_ms = int(message.body.get("duration_ms", 1000))
+                    result = await self._run_bounded_hardware_command(
+                        MessageType.CALIBRATION_SAMPLE.value,
+                        self.agent.capture_calibration_sample,
+                        duration_sec=duration_ms / 1000.0,
+                        timeout=duration_ms / 1000.0 + CALIBRATION_OPERATION_GRACE_SEC,
+                    )
+                    await client.send(
+                        WireMessage(
+                            MessageType.ACK,
+                            {
+                                "command": MessageType.CALIBRATION_SAMPLE.value,
+                                **result,
+                            },
+                            request_id=request_id,
+                        )
+                    )
+                elif message.message_type == MessageType.SET_THRUST_CALIBRATION:
+                    scale = float(message.body.get("scale_N_per_count"))
+                    offset = float(message.body.get("offset_N"))
+                    if not math.isfinite(scale) or not math.isfinite(offset):
+                        raise ProtocolError("calibration values must be finite")
+                    updated_config = self.agent.updated_thrust_calibration(
+                        scale_N_per_count=scale,
+                        offset_N=offset,
+                    )
+                    # Persist first: a failed write must not leave an apparent
+                    # in-memory calibration that disappears on the next reboot.
+                    if self._config_update_callback is not None:
+                        self._config_update_callback(updated_config)
+                    self.agent.apply_idle_config(updated_config)
+                    self.config = updated_config
+                    await client.send(
+                        WireMessage(
+                            MessageType.ACK,
+                            {
+                                "command": MessageType.SET_THRUST_CALIBRATION.value,
+                                "thrust": {
+                                    "channel": updated_config.thrust.channel,
+                                    "scale": updated_config.thrust.scale,
+                                    "offset": updated_config.thrust.offset,
+                                },
+                            },
+                            request_id=request_id,
+                        )
+                    )
                 else:
                     raise ProtocolError(
                         f"unsupported command: {message.message_type.value}"
                     )
-        except (DaqError, SessionError, ProtocolError, OSError, ValueError) as exc:
+        except (
+            DaqError,
+            SessionError,
+            ProtocolError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:
             await client.send(
                 WireMessage(
                     MessageType.ERROR,
@@ -216,16 +297,102 @@ class TelemetryServer:
                 )
             )
 
+    async def _run_bounded_hardware_command(
+        self,
+        command_name: str,
+        operation: Callable[..., Any],
+        *args: object,
+        timeout: float,
+        **kwargs: object,
+    ) -> Any:
+        """Run a USB operation without allowing a late success to surprise UI.
+
+        Python cannot safely kill a thread stuck in a kernel USB ioctl.  The
+        cancellation event tells the operation to clean itself up if that call
+        eventually returns; until the external DAQ recovery restarts this
+        service, later start/calibration commands are rejected deterministically.
+        """
+
+        if self._hardware_recovery_required is not None:
+            raise DaqError(
+                "USB-4704 recovery is required after "
+                f"{self._hardware_recovery_required} timed out. "
+                "Run DAQ 초기화 before starting or calibrating again."
+            )
+
+        cancel_event = threading.Event()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                operation,
+                *args,
+                cancel_event=cancel_event,
+                **kwargs,
+            )
+        )
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            cancel_event.set()
+            self._hardware_recovery_required = command_name
+            task.add_done_callback(self._consume_timed_out_command_result)
+            raise DaqError(
+                f"USB-4704 {command_name} did not return within {timeout:.1f}s. "
+                "Run DAQ 초기화; a delayed command will not start a session."
+            ) from exc
+
+    @staticmethod
+    def _consume_timed_out_command_result(task: asyncio.Task[Any]) -> None:
+        # A result is intentionally discarded after the caller received the
+        # deterministic recovery-required error. Consume its exception so an
+        # eventual driver failure does not become an unhandled asyncio task.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
+
     async def _stream_loop(
         self, client: _Client, subscriber: queue.Queue[DaqBlock]
     ) -> None:
+        pending: list[DaqBlock] = []
+        last_send = time.monotonic()
         while True:
             try:
                 block = subscriber.get_nowait()
             except queue.Empty:
-                await asyncio.sleep(0.005)
+                if not pending:
+                    # A standard Queue has no asyncio notification. Never
+                    # sleep(0) here: that would turn an idle dashboard into a
+                    # busy loop after a batch is sent.
+                    await asyncio.sleep(IDLE_STREAM_POLL_INTERVAL_SEC)
+                    continue
+                now = time.monotonic()
+                if now - last_send >= TELEMETRY_BATCH_INTERVAL_SEC:
+                    await client.send(
+                        self._telemetry_message(self._merge_blocks(pending))
+                    )
+                    pending.clear()
+                    last_send = now
+                    continue
+                remaining = TELEMETRY_BATCH_INTERVAL_SEC - (now - last_send)
+                await asyncio.sleep(min(0.005, remaining))
                 continue
-            await client.send(self._telemetry_message(block))
+
+            # A dropped transport block must stay visible as an index gap in
+            # the client. Do not concatenate it into a fabricated continuous
+            # trace.
+            if pending and not self._blocks_are_contiguous(pending[-1], block):
+                await client.send(
+                    self._telemetry_message(self._merge_blocks(pending))
+                )
+                pending.clear()
+                last_send = time.monotonic()
+
+            pending.append(block)
+            now = time.monotonic()
+            if now - last_send >= TELEMETRY_BATCH_INTERVAL_SEC:
+                await client.send(
+                    self._telemetry_message(self._merge_blocks(pending))
+                )
+                pending.clear()
+                last_send = now
 
     async def _health_loop(self, client: _Client) -> None:
         while True:
@@ -248,4 +415,31 @@ class TelemetryServer:
             sample_rate=block.sample_rate,
             channel_names=("thrust_N", "pressure_bar"),
             values=values,
+        )
+
+    @staticmethod
+    def _blocks_are_contiguous(previous: DaqBlock, following: DaqBlock) -> bool:
+        return (
+            following.sequence == previous.sequence + 1
+            and following.first_sample_index == previous.last_sample_index + 1
+            and following.sample_rate == previous.sample_rate
+            and following.channel_numbers == previous.channel_numbers
+        )
+
+    @staticmethod
+    def _merge_blocks(blocks: list[DaqBlock]) -> DaqBlock:
+        if not blocks:
+            raise ValueError("cannot merge an empty DAQ block list")
+        if len(blocks) == 1:
+            return blocks[0]
+        first = blocks[0]
+        last = blocks[-1]
+        return DaqBlock(
+            sequence=last.sequence,
+            first_sample_index=first.first_sample_index,
+            sample_rate=first.sample_rate,
+            channel_numbers=first.channel_numbers,
+            raw_samples=np.concatenate(
+                [block.raw_samples for block in blocks], axis=0
+            ),
         )

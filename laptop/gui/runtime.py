@@ -19,6 +19,9 @@ class BackendSignals(QObject):
     error = Signal(str)
     session_started = Signal(object)
     session_stopped = Signal(object)
+    calibration_sampled = Signal(object)
+    calibration_saved = Signal(object)
+    daq_reset_finished = Signal(object)
     system_test_finished = Signal(object)
     remote_log_downloaded = Signal(str)
 
@@ -68,6 +71,30 @@ class BackendRuntime:
         self._submit(
             self._require_backend().stop_session(), self.signals.session_stopped
         )
+
+    def capture_calibration_sample(self, *, row: int, duration_ms: int) -> None:
+        async def capture() -> dict[str, Any]:
+            result = await self._require_backend().capture_calibration_sample(
+                duration_ms
+            )
+            result["_ui_row"] = row
+            return result
+
+        self._submit(capture(), self.signals.calibration_sampled)
+
+    def save_thrust_calibration(
+        self, *, scale_N_per_count: float, offset_N: float
+    ) -> None:
+        self._submit(
+            self._require_backend().set_thrust_calibration(
+                scale_N_per_count=scale_N_per_count,
+                offset_N=offset_N,
+            ),
+            self.signals.calibration_saved,
+        )
+
+    def reset_daq(self) -> None:
+        self._submit(self._require_backend().reset_daq(), self.signals.daq_reset_finished)
 
     def run_system_test(self) -> None:
         backend = self._require_backend()

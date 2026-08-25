@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+
+import numpy as np
 
 from common.config import TmsConfig
 from common.protocol import TelemetryBlock
@@ -16,6 +19,12 @@ ConnectionCallback = Callable[[str, str], None]
 BlockCallback = Callable[[TelemetryBlock], None]
 HealthCallback = Callable[[dict[str, Any]], None]
 ErrorCallback = Callable[[str], None]
+
+# USB-4704 acquisition and logging retain every 10 ms block.  The desktop does
+# not need to repaint at that rate, though: limiting cross-thread Qt updates to
+# 20 Hz keeps controls responsive while retaining a maximum display latency of
+# one visual interval.
+VISUAL_BLOCK_INTERVAL_SEC = 0.05
 
 
 class DashboardBackend:
@@ -55,6 +64,7 @@ class DashboardBackend:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._block_task: asyncio.Task[None] | None = None
         self._health_task: asyncio.Task[None] | None = None
+        self._daq_recovery_in_progress = False
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -80,12 +90,14 @@ class DashboardBackend:
                     self._health_task = asyncio.create_task(self._report_health())
                     await self.telemetry.wait_connection_lost()
                 except SshConnectionError as exc:
-                    self._error(str(exc))
+                    if not self._daq_recovery_in_progress:
+                        self._error(str(exc))
                     if exc.kind == SshFailureKind.AUTHENTICATION:
                         self._connection("SSH", "AUTHENTICATION_FAILED")
                         return
                 except TelemetryError as exc:
-                    self._error(str(exc))
+                    if not self._daq_recovery_in_progress:
+                        self._error(str(exc))
                 finally:
                     await self.telemetry.disconnect()
                     if self._block_task is not None:
@@ -128,11 +140,79 @@ class DashboardBackend:
     async def stop_session(self) -> dict[str, Any]:
         return await self.telemetry.stop_session()
 
+    async def capture_calibration_sample(self, duration_ms: int) -> dict[str, Any]:
+        return await self.telemetry.capture_calibration_sample(duration_ms)
+
+    async def set_thrust_calibration(
+        self, *, scale_N_per_count: float, offset_N: float
+    ) -> dict[str, Any]:
+        return await self.telemetry.set_thrust_calibration(
+            scale_N_per_count=scale_N_per_count,
+            offset_N=offset_N,
+        )
+
+    async def reset_daq(self) -> dict[str, object]:
+        # Deliberately do not preflight with telemetry.ping(). A wedged
+        # USB-4704 can leave the agent's command path unable to answer PING,
+        # which used to make the recovery button fail before it could run.
+        # recover_usb4704() uses a separate SSH control connection and stops
+        # the agent itself, so it remains usable precisely in that state.
+        self._connection("DAQ", "INITIALIZING")
+        self._daq_recovery_in_progress = True
+        try:
+            return await self.ssh.recover_usb4704()
+        finally:
+            self._daq_recovery_in_progress = False
+
     async def _consume_blocks(self) -> None:
+        pending: list[TelemetryBlock] = []
+        last_publish = time.monotonic()
         while True:
             block = await self.telemetry.wait_for_block()
-            if self.block_callback is not None:
-                self.block_callback(block)
+            if self.block_callback is None:
+                continue
+
+            # Never manufacture a continuous trace across a transport gap or
+            # a changed DAQ configuration. Flush the preceding trace first so
+            # the GUI can preserve the actual sample indices.
+            if pending and not self._blocks_are_contiguous(pending[-1], block):
+                self.block_callback(self._merge_blocks(pending))
+                pending.clear()
+                last_publish = time.monotonic()
+
+            pending.append(block)
+            now = time.monotonic()
+            if now - last_publish >= VISUAL_BLOCK_INTERVAL_SEC:
+                self.block_callback(self._merge_blocks(pending))
+                pending.clear()
+                last_publish = now
+
+    @staticmethod
+    def _blocks_are_contiguous(
+        previous: TelemetryBlock, following: TelemetryBlock
+    ) -> bool:
+        return (
+            following.first_sample_index
+            == previous.first_sample_index + previous.sample_count
+            and following.sample_rate == previous.sample_rate
+            and following.channel_names == previous.channel_names
+        )
+
+    @staticmethod
+    def _merge_blocks(blocks: list[TelemetryBlock]) -> TelemetryBlock:
+        if not blocks:
+            raise ValueError("cannot merge an empty telemetry block list")
+        if len(blocks) == 1:
+            return blocks[0]
+        first = blocks[0]
+        last = blocks[-1]
+        return TelemetryBlock(
+            sequence=last.sequence,
+            first_sample_index=first.first_sample_index,
+            sample_rate=first.sample_rate,
+            channel_names=first.channel_names,
+            values=np.concatenate([block.values for block in blocks], axis=0),
+        )
 
     async def _report_health(self) -> None:
         while True:
