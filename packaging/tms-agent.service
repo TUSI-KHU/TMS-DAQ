@@ -1,0 +1,27 @@
+[Unit]
+Description=TUSI TMS acquisition and logging agent
+Wants=systemd-modules-load.service
+After=network.target systemd-modules-load.service
+
+[Service]
+Type=simple
+User=tms
+Group=tms
+SupplementaryGroups=plugdev
+WorkingDirectory=/var/lib/tusi-tms
+# The + prefix makes only this pre-start helper run as root.  The agent itself
+# remains the unprivileged tms user.  The helper targets only USB 1809:4704
+# and continues on a failed probe so telemetry can surface the diagnosis.
+ExecStartPre=+/opt/tusi-tms/bin/reset-usb4704-on-start.sh /dev/daq0
+ExecStart=/opt/tusi-tms/.venv/bin/tms-agent --config /etc/tusi-tms/config.yaml
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tusi-tms
+
+[Install]
+WantedBy=multi-user.target

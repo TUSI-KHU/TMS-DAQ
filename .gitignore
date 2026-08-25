@@ -1,0 +1,40 @@
+# Local configuration and acquired data
+/config.yaml
+/.env
+/.env.*
+/logs/
+*.h5
+
+# Python environments, caches, and test coverage
+/.venv/
+/.venv-package/
+/*.egg-info/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+/htmlcov/
+/.coverage
+/coverage.xml
+__pycache__/
+*.py[cod]
+
+# Build and packaging output
+/build/
+/dist/
+/out/
+
+# Linux kernel-module build output
+/vendor/advantech-daqnavi/drivers/bin/
+/vendor/advantech-daqnavi/drivers/lib/
+/.tmp_versions/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+
+# Editor and desktop metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,3 @@
+# Advantech Bionic DAQ Device name and permission rules
+SUBSYSTEMS=="daq", ACTION=="add", MODE="0666", RUN+="/opt/advantech/daqnavi_daemon/daqnavi_daemon +%r/%k"
+SUBSYSTEMS=="daq", ACTION=="remove",           RUN+="/opt/advantech/daqnavi_daemon/daqnavi_daemon -%r/%k"

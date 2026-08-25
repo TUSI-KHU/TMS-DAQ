@@ -1,0 +1,37 @@
+system:
+  pi_host: 192.168.0.214
+  telemetry_port: 29100
+
+ssh:
+  port: 22
+  username: tms
+  password: tms
+  remember_password: true
+  connect_timeout_sec: 10
+  keepalive_interval_sec: 5
+
+nano:
+  port: auto
+  baudrate: 115200
+  heartbeat_timeout_sec: 2
+
+daq:
+  device: /dev/daq0
+  sample_rate: 5000
+  block_ms: 10
+
+channels:
+  thrust:
+    channel: 0
+    scale: 0.01
+    offset: 0.0
+  pressure:
+    channel: 1
+    scale: 0.001
+    offset: 0.0
+
+logging:
+  directory: logs
+  pi_directory: /var/lib/tusi-tms/logs
+  ring_buffer_sec: 5
+  flush_interval_sec: 1

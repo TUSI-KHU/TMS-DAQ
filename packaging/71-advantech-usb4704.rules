@@ -1,0 +1,4 @@
+# USB-4704 DAQ character devices. The upstream rule invokes an x86-only
+# daqnavi_daemon, so the ARM64 port deliberately uses permissions only.
+SUBSYSTEM=="daq", KERNEL=="daq*", GROUP="plugdev", MODE="0660", TAG+="uaccess"
+
