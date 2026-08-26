@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QGroupBox, QLineEdit, QTa
 from common.config import ChannelConfig, DaqConfig, LoggingConfig, TmsConfig
 from common.protocol import TelemetryBlock
 from laptop.gui.calibration_dialog import LoadCellCalibrationDialog
-from laptop.gui.main_window import MainWindow, PLOT_MAX_POINTS
+from laptop.gui.main_window import MainWindow, PLOT_HISTORY_SECONDS, PLOT_MAX_POINTS
 
 
 def test_dashboard_builds_with_required_tabs_and_masked_password(
@@ -72,7 +72,9 @@ def test_live_quadrants_select_channels_and_refresh_values(tmp_path, monkeypatch
     window._receive_block(
         TelemetryBlock(
             sequence=1,
-            first_sample_index=0,
+            # A resumed/reconnected DAQ can use a large absolute sample index;
+            # the operator plot must still start its own clock at 0 s.
+            first_sample_index=9_876_543_210_123,
             sample_rate=1000,
             channel_names=("thrust_N", "pressure_bar"),
             values=np.asarray(((10.0, 1.2), (12.5, 1.4), (11.0, 1.3)), dtype=np.float32),
@@ -83,8 +85,11 @@ def test_live_quadrants_select_channels_and_refresh_values(tmp_path, monkeypatch
     assert window._signal_panels[1].current.text() == "1.300 bar"
     assert "10.00 N – 12.50 N" in window._signal_panels[0].range_label.text()
     assert "1.200 bar – 1.400 bar" in window._signal_panels[1].range_label.text()
-    _, physical_thrust = window._signal_panels[0].curve.getData()
+    plotted_time, physical_thrust = window._signal_panels[0].curve.getOriginalDataset()
+    np.testing.assert_allclose(plotted_time, (0.0, 0.001, 0.002))
     np.testing.assert_allclose(physical_thrust, (10.0, 12.5, 11.0))
+    assert window._plot_time_origin == 9_876_543_210_123
+    assert not window._signal_panels[0].plot.getAxis("bottom").autoSIPrefix
     y_min, y_max = window._signal_panels[0].plot.getViewBox().viewRange()[1]
     assert y_min < 10.0 < 12.5 < y_max
 
@@ -101,6 +106,54 @@ def test_live_quadrants_select_channels_and_refresh_values(tmp_path, monkeypatch
         }
     )
     assert "USB-4704 start returned EIO" in window.pipeline_message.text()
+    window.close()
+    app.processEvents()
+
+
+def test_start_session_immediately_clears_live_plot(tmp_path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    config = TmsConfig(
+        daq=DaqConfig(sample_rate=1000, block_ms=10),
+        thrust=ChannelConfig(0, 1.0, 0.0),
+        pressure=ChannelConfig(1, 1.0, 0.0),
+        logging=LoggingConfig(directory=tmp_path),
+    )
+    monkeypatch.setattr(MainWindow, "_start_runtime", lambda self: None)
+    window = MainWindow(config, tmp_path / "config.yaml")
+    window._receive_block(
+        TelemetryBlock(
+            sequence=1,
+            first_sample_index=500,
+            sample_rate=1000,
+            channel_names=("thrust_N", "pressure_bar"),
+            values=np.asarray(((10.0, 1.2),), dtype=np.float32),
+        )
+    )
+
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+
+        def start_session(self, name: str) -> None:
+            self.started.append(name)
+
+        def stop(self) -> None:
+            pass
+
+    runtime = RuntimeStub()
+    window._runtime = runtime  # type: ignore[assignment]
+    window.start_button.setEnabled(True)
+    window._start_session()
+
+    assert runtime.started == ["KNSB_TEST_001"]
+    assert not len(window._sample_indices)
+    assert window._plot_time_origin is None
+    plotted_time, plotted_values = window._signal_panels[0].curve.getData()
+    assert plotted_time is None and plotted_values is None
+    x_min, x_max = window._signal_panels[0].plot.getViewBox().viewRange()[0]
+    assert x_min == 0.0
+    assert x_max == PLOT_HISTORY_SECONDS
+    assert window.state_label.text() == "STATUS: STARTING"
     window.close()
     app.processEvents()
 

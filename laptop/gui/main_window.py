@@ -94,6 +94,7 @@ DEFAULT_LIVE_CHANNELS = ("thrust_N", "pressure_bar")
 # Retain a full 10-second physical-value history for metrics and log context,
 # but draw only a peak-preserving envelope.  Rendering the whole 50,000 point
 # window for two panels on every 10 ms DAQ block is what made the UI sluggish.
+PLOT_HISTORY_SECONDS = 10.0
 PLOT_MAX_POINTS = 2_000
 PLOT_REFRESH_INTERVAL_SEC = 0.10
 
@@ -129,6 +130,10 @@ class MainWindow(QMainWindow):
         self._signal_panels: list[SignalPanel] = []
         self._last_sample_rate = self.config.daq.sample_rate
         self._trigger_sample: int | None = None
+        # DAQ sample indexes need not start at zero after a reconnect.  Keep
+        # the plot clock independent of them so every measurement starts at
+        # 0 s on screen.
+        self._plot_time_origin: int | None = None
         self._last_plot_update = 0.0
         self._sessions = []
         self._calibration_dialog: LoadCellCalibrationDialog | None = None
@@ -194,6 +199,10 @@ class MainWindow(QMainWindow):
         plot = pg.PlotWidget()
         plot.setMinimumHeight(235)
         plot.showGrid(x=True, y=True, alpha=0.22)
+        # Keep the operator-facing clock in plain seconds.  Otherwise
+        # pyqtgraph abbreviates an accidentally large sample index as Ts/Ys.
+        plot.getAxis("bottom").enableAutoSIPrefix(False)
+        plot.setXRange(0.0, PLOT_HISTORY_SECONDS, padding=0.0)
         curve = plot.plot(pen=pg.mkPen("#0f62fe", width=2))
         curve.setClipToView(True)
         curve.setDownsampling(auto=True, method="peak")
@@ -375,7 +384,7 @@ class MainWindow(QMainWindow):
         display = self._channel_display(channel_name)
         panel.plot.setTitle(f"{display.label} · Y축 자동 범위")
         panel.plot.setLabel("left", display.label, units=display.unit)
-        panel.plot.setLabel("bottom", "시간", units="s")
+        panel.plot.setLabel("bottom", "측정 시작 후 시간", units="s")
         panel.curve.setPen(pg.mkPen(display.color, width=2))
         panel.range_label.setText(f"Y축 자동 범위 · {display.label}: 데이터 대기")
 
@@ -407,9 +416,19 @@ class MainWindow(QMainWindow):
                 panel.current.setText("--")
                 panel.peak.setText("--")
             return
-        origin = self._trigger_sample if self._trigger_sample is not None else 0
-        times = (self._sample_indices - origin) / self._last_sample_rate
+        if self._plot_time_origin is None:
+            self._plot_time_origin = int(self._sample_indices[0])
+        # Subtract while the indexes are still int64.  Converting a large
+        # absolute DAQ index to float first can round adjacent samples into
+        # the same x-coordinate.
+        times = (self._sample_indices - self._plot_time_origin).astype(
+            np.float64
+        ) / float(self._last_sample_rate)
+        latest_time = max(0.0, float(times[-1]))
+        x_min = max(0.0, latest_time - PLOT_HISTORY_SECONDS)
+        x_max = max(PLOT_HISTORY_SECONDS, latest_time)
         for panel in self._signal_panels:
+            panel.plot.setXRange(x_min, x_max, padding=0.0)
             channel_name = self._selected_channel(panel)
             values = self._channel_values.get(channel_name)
             if values is None or len(values) != len(self._sample_indices):
@@ -645,6 +664,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "시험명 필요", "Test Name을 입력하십시오.")
             return
         assert self._runtime is not None
+        # Clear immediately on the operator action, rather than waiting for
+        # the asynchronous START_SESSION acknowledgement.
+        self._clear_graphs()
         self.start_button.setEnabled(False)
         self.state_label.setText("STATUS: STARTING")
         self._runtime.start_session(name)
@@ -786,6 +808,8 @@ class MainWindow(QMainWindow):
             self._clear_graphs()
             self._sync_channel_selectors(block.channel_names)
 
+        if self._plot_time_origin is None:
+            self._plot_time_origin = int(block.first_sample_index)
         self._sample_indices = np.concatenate(
             (
                 self._sample_indices,
@@ -809,7 +833,9 @@ class MainWindow(QMainWindow):
                     float(np.max(finite)),
                 )
 
-        max_points = max(block.sample_rate * 10, block.sample_count)
+        max_points = max(
+            int(block.sample_rate * PLOT_HISTORY_SECONDS), block.sample_count
+        )
         if len(self._sample_indices) > max_points:
             self._sample_indices = self._sample_indices[-max_points:]
             for channel_name in self._channel_names:
@@ -1100,12 +1126,18 @@ class MainWindow(QMainWindow):
             for channel_name in self._channel_names
         }
         self._trigger_sample = None
+        self._plot_time_origin = None
         self._peak_values = {}
         self._last_plot_update = 0.0
         for panel in self._signal_panels:
             panel.curve.clear()
             panel.current.setText("--")
             panel.peak.setText("--")
+            panel.range_label.setText(
+                f"Y축 자동 범위 · {self._channel_display(self._selected_channel(panel)).label}: "
+                "데이터 대기"
+            )
+            panel.plot.setXRange(0.0, PLOT_HISTORY_SECONDS, padding=0.0)
         if hasattr(self, "t_plus"):
             self.t_plus.setText("Pre-trigger")
         if hasattr(self, "data_window"):
