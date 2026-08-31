@@ -176,6 +176,10 @@ class TmsAgent:
             "logger_dropped_blocks": self._dropped_blocks,
             "telemetry_dropped_blocks": self._telemetry_dropped_blocks,
             "sample_rate": self.config.daq.sample_rate,
+            "low_pass": {
+                "enabled": self.config.low_pass.enabled,
+                "cutoff_hz": self.config.low_pass.cutoff_hz,
+            },
             "daq_source": self.daq.source_kind,
             "daq_probe": dict(self._daq_probe),
             "daq_stream_age_sec": block_age,
@@ -287,6 +291,20 @@ class TmsAgent:
             ),
         )
 
+    def updated_pressure_calibration(
+        self, *, scale_bar_per_count: float, offset_bar: float
+    ) -> TmsConfig:
+        """Build a validation-backed config for a new fixed-AI1 calibration."""
+
+        return replace(
+            self.config,
+            pressure=ChannelConfig(
+                channel=self.config.pressure.channel,
+                scale=scale_bar_per_count,
+                offset=offset_bar,
+            ),
+        )
+
     def apply_idle_config(self, config: TmsConfig) -> None:
         """Install a persisted calibration for the next session while idle."""
 
@@ -297,10 +315,11 @@ class TmsAgent:
             or config.ssh != self.config.ssh
             or config.nano != self.config.nano
             or config.daq != self.config.daq
-            or config.pressure != self.config.pressure
             or config.logging != self.config.logging
         ):
-            raise SessionError("only the fixed AI0 load-cell calibration may change")
+            raise SessionError("only the fixed AI0/AI1 sensor calibration may change")
+        if config.thrust != self.config.thrust and config.pressure != self.config.pressure:
+            raise SessionError("only one sensor calibration may change at a time")
         self.config = config
         # The logger writes the effective calibration into every subsequent
         # HDF5 session's metadata, so rebuild it before the next start.

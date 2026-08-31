@@ -47,7 +47,10 @@ from common.config import (
     save_config,
 )
 from common.protocol import TelemetryBlock
-from laptop.gui.calibration_dialog import LoadCellCalibrationDialog
+from laptop.gui.calibration_dialog import (
+    LoadCellCalibrationDialog,
+    PressureCalibrationDialog,
+)
 from laptop.gui.runtime import BackendRuntime, BackendSignals
 from laptop.logs import LogError, export_csv, list_sessions
 from laptop.operator_defaults import apply_field_connection
@@ -84,8 +87,8 @@ class SignalPanel:
 
 
 CHANNEL_DISPLAYS: dict[str, ChannelDisplay] = {
-    "thrust_N": ChannelDisplay("추력", "N", "#0f62fe", 2),
-    "pressure_bar": ChannelDisplay("압력", "bar", "#8a3ffc", 3),
+    "thrust_N": ChannelDisplay("추력 (LPF)", "N", "#0f62fe", 2),
+    "pressure_bar": ChannelDisplay("압력 (LPF)", "bar", "#8a3ffc", 3),
     "raw_thrust": ChannelDisplay("추력 원시값", "ADC", "#42be65", 0),
     "raw_pressure": ChannelDisplay("압력 원시값", "ADC", "#ff832b", 0),
 }
@@ -136,7 +139,7 @@ class MainWindow(QMainWindow):
         self._plot_time_origin: int | None = None
         self._last_plot_update = 0.0
         self._sessions = []
-        self._calibration_dialog: LoadCellCalibrationDialog | None = None
+        self._calibration_dialog: LoadCellCalibrationDialog | PressureCalibrationDialog | None = None
         self._daq_reset_in_progress = False
 
         self.tabs = QTabWidget()
@@ -304,6 +307,12 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.calibration_button)
 
+        self.pressure_calibration_button = QPushButton("AI1 압력 보정")
+        self.pressure_calibration_button.setToolTip(
+            "실행 전 AI1 원시값을 취득해 2점 또는 3점 기준압력 보정을 저장합니다"
+        )
+        layout.addWidget(self.pressure_calibration_button)
+
         self.daq_reset_button = QPushButton("DAQ 초기화")
         self.daq_reset_button.setEnabled(False)
         self.daq_reset_button.setToolTip(
@@ -339,6 +348,7 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self._start_session)
         self.stop_button.clicked.connect(self._stop_session)
         self.calibration_button.clicked.connect(self._open_calibration)
+        self.pressure_calibration_button.clicked.connect(self._open_pressure_calibration)
         self.daq_reset_button.clicked.connect(self._reset_daq)
         setup_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
         system_test_button.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
@@ -535,7 +545,14 @@ class MainWindow(QMainWindow):
             f"DAQ {self.config.daq.sample_rate:,} S/s · "
             f"AI{self.config.thrust.channel}=로드셀, "
             f"AI{self.config.pressure.channel}=두번째 센서 · "
-            "표시: 실제 물리량 · 그래프 Y축 자동 범위"
+            f"압력 입력 {self.config.pressure_input.shunt_ohms:g} Ω "
+            f"({self.config.pressure_input.signal_voltage_min_v:.3f}–"
+            f"{self.config.pressure_input.signal_voltage_max_v:.3f} V) · "
+            f"압력 보정 scale={self.config.pressure.scale:.6g}, "
+            f"offset={self.config.pressure.offset:.6g} bar · "
+            f"표시/저장 LPF={'ON' if self.config.low_pass.enabled else 'OFF'} "
+            f"({self.config.low_pass.cutoff_hz:g} Hz) · "
+            "원본 raw/비필터 물리값도 함께 저장"
         )
 
     def _build_setup(self) -> QWidget:
@@ -552,6 +569,13 @@ class MainWindow(QMainWindow):
         self.nano_port = QLineEdit(self.config.nano.port)
         self.sample_rate_setup = self._spin(1, 47_619, self.config.daq.sample_rate)
         self.block_ms = self._spin(1, 1000, self.config.daq.block_ms)
+        low_pass_info = QLabel(
+            f"화면/로그 LPF: "
+            f"{'사용' if self.config.low_pass.enabled else '사용 안 함'} · "
+            f"차단주파수 {self.config.low_pass.cutoff_hz:g} Hz "
+            "(Pi와 동일 설정)"
+        )
+        low_pass_info.setWordWrap(True)
         self.thrust_channel = self._spin(
             THRUST_AI_CHANNEL, THRUST_AI_CHANNEL, THRUST_AI_CHANNEL
         )
@@ -573,8 +597,14 @@ class MainWindow(QMainWindow):
                 self.remember_password,
             ):
                 widget.setEnabled(False)
+        display_filter = (
+            f"{self.config.low_pass.cutoff_hz:g} Hz LPF 처리된"
+            if self.config.low_pass.enabled
+            else "비필터"
+        )
         display_scale = QLabel(
-            "실제 물리값·단위를 표시하고, 그래프 Y축 높이만 최근 데이터 min–max에 맞춥니다."
+            f"실시간 추력/압력은 Pi에서 {display_filter} 물리값을 표시합니다. "
+            "원본 raw와 비필터 물리값은 로그에 함께 저장합니다."
         )
         display_scale.setWordWrap(True)
         fields = (
@@ -587,6 +617,7 @@ class MainWindow(QMainWindow):
             ("Nano Port", self.nano_port),
             ("Sample Rate", self.sample_rate_setup),
             ("Block ms", self.block_ms),
+            ("Low-pass filter", low_pass_info),
             ("AI0 (로드셀 · 고정)", self.thrust_channel),
             ("AI1 (두번째 센서 · 고정)", self.pressure_channel),
             ("Display Scale", display_scale),
@@ -699,6 +730,31 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self._calibration_dialog = None
 
+    def _open_pressure_calibration(self) -> None:
+        if self._runtime is None:
+            QMessageBox.warning(
+                self, "연결 대기", "Pi telemetry 연결이 준비된 뒤 보정하십시오."
+            )
+            return
+        if self.stop_button.isEnabled():
+            QMessageBox.warning(
+                self, "측정 중", "측정을 종료한 뒤에만 실행 전 캘리브레이션을 할 수 있습니다."
+            )
+            return
+        dialog = PressureCalibrationDialog(
+            current_scale=self.config.pressure.scale,
+            current_offset=self.config.pressure.offset,
+            shunt_ohms=self.config.pressure_input.shunt_ohms,
+            loop_min_mA=self.config.pressure_input.loop_min_mA,
+            loop_max_mA=self.config.pressure_input.loop_max_mA,
+            parent=self,
+        )
+        dialog.capture_requested.connect(self._capture_calibration_sample)
+        dialog.save_requested.connect(self._save_pressure_calibration)
+        self._calibration_dialog = dialog
+        dialog.exec()
+        self._calibration_dialog = None
+
     def _reset_daq(self) -> None:
         if self._runtime is None:
             QMessageBox.warning(
@@ -753,15 +809,38 @@ class MainWindow(QMainWindow):
             offset_N=offset_N,
         )
 
+    def _save_pressure_calibration(
+        self, scale_bar_per_count: float, offset_bar: float
+    ) -> None:
+        if self._runtime is None:
+            if self._calibration_dialog is not None:
+                self._calibration_dialog.operation_failed("Pi telemetry 연결이 없습니다")
+            return
+        self._runtime.save_pressure_calibration(
+            scale_bar_per_count=scale_bar_per_count,
+            offset_bar=offset_bar,
+        )
+
     def _calibration_saved(self, result: dict[str, Any]) -> None:
         try:
-            thrust = result["thrust"]
-            updated = ChannelConfig(
-                channel=THRUST_AI_CHANNEL,
-                scale=float(thrust["scale"]),
-                offset=float(thrust["offset"]),
-            )
-            self.config = replace(self.config, thrust=updated)
+            if "thrust" in result:
+                thrust = result["thrust"]
+                updated = ChannelConfig(
+                    channel=THRUST_AI_CHANNEL,
+                    scale=float(thrust["scale"]),
+                    offset=float(thrust["offset"]),
+                )
+                self.config = replace(self.config, thrust=updated)
+            elif "pressure" in result:
+                pressure = result["pressure"]
+                updated = ChannelConfig(
+                    channel=SECOND_SENSOR_AI_CHANNEL,
+                    scale=float(pressure["scale"]),
+                    offset=float(pressure["offset"]),
+                )
+                self.config = replace(self.config, pressure=updated)
+            else:
+                raise KeyError("thrust or pressure")
             save_config(self.config, self.config_path)
             self._update_quick_settings_summary()
         except (ConfigError, KeyError, TypeError, ValueError) as exc:
@@ -1001,6 +1080,8 @@ class MainWindow(QMainWindow):
                     self.config.pressure.scale,
                     self.config.pressure.offset,
                 ),
+                pressure_input=self.config.pressure_input,
+                low_pass=self.config.low_pass,
                 logging=LoggingConfig(
                     directory=Path(self.log_directory.text()),
                     ring_buffer_sec=self.config.logging.ring_buffer_sec,

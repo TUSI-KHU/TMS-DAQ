@@ -508,6 +508,8 @@ HDF5를 기본 저장 포맷으로 사용한다.
     raw_pressure
     thrust_N
     pressure_bar
+    thrust_N_lpf
+    pressure_bar_lpf
 
 /events
 
@@ -523,6 +525,7 @@ start_time
 sample_rate
 DAQ configuration
 sensor calibration
+low-pass filter configuration
 software version
 ```
 
@@ -1290,9 +1293,23 @@ channels:
     scale: ...
     offset: ...
 
+pressure_input:
+  # 현장 배선: 4–20 mA를 100 Ω 션트로 AI1에 입력
+  shunt_ohms: 100.0
+  loop_min_mA: 4.0
+  loop_max_mA: 20.0
+
+low_pass:
+  enabled: true
+  cutoff_hz: 50.0
+
 logging:
   ring_buffer_sec: 5
 ```
+
+AI1의 100 Ω 션트에서는 4–20 mA가 0.4–2.0 V가 된다. `scale`/`offset`은
+센서의 실제 압력 범위를 알고 있는 기준압력 2점 또는 3점으로 별도 보정한다.
+저항값을 변경한 경우에는 실제 배선 상태에서 AI1 압력 보정을 다시 수행한다.
 
 실제 password가 들어간 파일은 repository에 commit하지 않는다.
 

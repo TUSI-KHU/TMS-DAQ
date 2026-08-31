@@ -21,11 +21,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from common.pressure import raw_code_to_current_mA, raw_code_to_voltage
 from laptop.calibration import (
     CalibrationError,
     CalibrationReference,
     LoadCellCalibration,
+    PressureCalibrationReference,
     fit_load_cell_calibration,
+    fit_pressure_calibration,
 )
 
 
@@ -279,3 +282,176 @@ class LoadCellCalibrationDialog(QDialog):
         self._saving = False
         self.apply_button.setEnabled(self._fit is not None)
         self.status_label.setText(f"작업 실패: {message}")
+
+
+class PressureCalibrationDialog(LoadCellCalibrationDialog):
+    """Collect two or three stable AI1 pressure references and persist their fit."""
+
+    def __init__(
+        self,
+        *,
+        current_scale: float,
+        current_offset: float,
+        shunt_ohms: float = 100.0,
+        loop_min_mA: float = 4.0,
+        loop_max_mA: float = 20.0,
+        parent=None,
+    ) -> None:
+        self._shunt_ohms = float(shunt_ohms)
+        self._loop_min_mA = float(loop_min_mA)
+        self._loop_max_mA = float(loop_max_mA)
+        super().__init__(
+            current_scale=current_scale, current_offset=current_offset, parent=parent
+        )
+        self.setWindowTitle("AI1 압력 실행 전 캘리브레이션")
+        intro = self.layout().itemAt(0).widget()
+        if isinstance(intro, QLabel):
+            intro.setText(
+                f"AI1은 4–20 mA 압력센서의 {self._shunt_ohms:g} Ω 션트 전압을 읽습니다. "
+                f"예상 입력은 {self._loop_min_mA:g} mA → "
+                f"{self._loop_min_mA / 1000.0 * self._shunt_ohms:.3f} V, "
+                f"{self._loop_max_mA:g} mA → "
+                f"{self._loop_max_mA / 1000.0 * self._shunt_ohms:.3f} V입니다. "
+                "압력을 안정화한 뒤 실제 기준압력을 입력하고 원시 ADC 평균을 취득하십시오."
+            )
+        self.reference_table.setHorizontalHeaderLabels(
+            ("기준점", "기준압력", "AI1 평균 (전압/전류)", "AI1 표준편차", "원시값 취득")
+        )
+        self.apply_button.setText("AI1 압력 보정값을 Pi에 저장")
+        self._rebuild_reference_rows()
+
+    def _rebuild_reference_rows(self) -> None:
+        point_count = int(self.point_count.currentData())
+        defaults = (0.0, 1.0) if point_count == 2 else (0.0, 0.5, 1.0)
+        self._captured.clear()
+        self._fit = None
+        self._pending_row = None
+        self._mass_fields.clear()
+        self._mean_labels.clear()
+        self._stddev_labels.clear()
+        self._capture_buttons.clear()
+        self.reference_table.setRowCount(point_count)
+        for row, pressure_bar in enumerate(defaults):
+            self.reference_table.setItem(row, 0, QTableWidgetItem(f"기준 {row + 1}"))
+            pressure = QDoubleSpinBox()
+            pressure.setRange(-100_000.0, 100_000.0)
+            pressure.setDecimals(4)
+            pressure.setSingleStep(0.1)
+            pressure.setValue(pressure_bar)
+            pressure.setSuffix(" bar")
+            pressure.valueChanged.connect(self._invalidate_fit)
+            self.reference_table.setCellWidget(row, 1, pressure)
+            self._mass_fields.append(pressure)
+            mean = QLabel("미취득")
+            stddev = QLabel("-")
+            self.reference_table.setCellWidget(row, 2, mean)
+            self.reference_table.setCellWidget(row, 3, stddev)
+            self._mean_labels.append(mean)
+            self._stddev_labels.append(stddev)
+            capture = QPushButton("원시값 취득")
+            capture.clicked.connect(
+                lambda _checked=False, selected_row=row: self._request_capture(selected_row)
+            )
+            self.reference_table.setCellWidget(row, 4, capture)
+            self._capture_buttons.append(capture)
+        self.apply_button.setEnabled(False)
+        self.result_label.setText(
+            "현재 AI1 설정: "
+            f"scale={self._current_scale:.9g} bar/count, "
+            f"offset={self._current_offset:.9g} bar"
+        )
+        self.status_label.setText("기준압력을 확인하고 각 행의 원시값을 취득하십시오.")
+
+    def record_capture(self, result: dict[str, Any]) -> None:
+        row = int(result.get("_ui_row", -1))
+        if row != self._pending_row or not 0 <= row < len(self._mass_fields):
+            return
+        try:
+            sample = result["channels"]["ai1"]
+            sample_count = int(sample["sample_count"])
+            mean = float(sample["mean"])
+            stddev = float(sample["stddev"])
+        except (KeyError, TypeError, ValueError) as exc:
+            self.operation_failed(f"AI1 취득 결과가 올바르지 않습니다: {exc}")
+            return
+        self._captured[row] = {
+            "sample_count": sample_count,
+            "mean": mean,
+            "stddev": stddev,
+        }
+        voltage = raw_code_to_voltage(mean)
+        current = raw_code_to_current_mA(mean, self._shunt_ohms)
+        self._mean_labels[row].setText(
+            f"{mean:.3f} count · {voltage:.4f} V / {current:.3f} mA "
+            f"({sample_count:,} samples)"
+        )
+        self._stddev_labels[row].setText(f"σ {stddev:.3f} count")
+        self._capture_buttons[row].setEnabled(True)
+        self._pending_row = None
+        self._invalidate_fit()
+        expected_min_v = self._loop_min_mA / 1000.0 * self._shunt_ohms
+        expected_max_v = self._loop_max_mA / 1000.0 * self._shunt_ohms
+        if not expected_min_v <= voltage <= expected_max_v:
+            self.status_label.setText(
+                f"기준 {row + 1} 취득 완료. 경고: {voltage:.4f} V가 "
+                f"예상 {expected_min_v:.3f}–{expected_max_v:.3f} V 범위를 벗어났습니다. "
+                "배선·전원·AI 입력 범위를 확인하십시오."
+            )
+        else:
+            self.status_label.setText(
+                f"기준 {row + 1} 취득 완료. 다음 기준점을 취득하거나 계산하십시오."
+            )
+
+    def _references(self) -> tuple[PressureCalibrationReference, ...]:
+        missing = [
+            str(index + 1)
+            for index in range(len(self._mass_fields))
+            if index not in self._captured
+        ]
+        if missing:
+            raise CalibrationError("기준점 " + ", ".join(missing) + "의 원시값이 없습니다")
+        return tuple(
+            PressureCalibrationReference(
+                pressure_bar=field.value(),
+                raw_mean=float(self._captured[index]["mean"]),
+                raw_stddev=float(self._captured[index]["stddev"]),
+                sample_count=int(self._captured[index]["sample_count"]),
+            )
+            for index, field in enumerate(self._mass_fields)
+        )
+
+    def _calculate(self) -> None:
+        try:
+            self._fit = fit_pressure_calibration(self._references())
+        except CalibrationError as exc:
+            self._fit = None
+            self.apply_button.setEnabled(False)
+            self.status_label.setText(f"계산 불가: {exc}")
+            return
+        residuals = ", ".join(f"{value:+.4f} bar" for value in self._fit.residuals_bar)
+        r_squared = "n/a" if self._fit.r_squared is None else f"{self._fit.r_squared:.6f}"
+        self.result_label.setText(
+            "새 AI1 보정값: "
+            f"scale={self._fit.scale_bar_per_count:.9g} bar/count, "
+            f"offset={self._fit.offset_bar:.9g} bar · "
+            f"RMSE={self._fit.rmse_bar:.4f} bar · R²={r_squared} · 잔차: {residuals}"
+        )
+        self.apply_button.setEnabled(True)
+        self.status_label.setText("계산 완료. 기준압력과 배선을 확인한 뒤 Pi 저장을 누르십시오.")
+
+    def _request_save(self) -> None:
+        if self._fit is None or self._saving:
+            return
+        self._saving = True
+        self.apply_button.setEnabled(False)
+        self.status_label.setText("Pi 설정 파일에 AI1 압력 보정값을 저장하는 중…")
+        self.save_requested.emit(self._fit.scale_bar_per_count, self._fit.offset_bar)
+
+    def calibration_saved(self, result: dict[str, Any]) -> None:
+        self._saving = False
+        pressure = result.get("pressure", {})
+        self.status_label.setText(
+            "저장 완료. 다음 측정 세션과 HDF5 로그에 AI1 압력 보정값이 적용됩니다. "
+            f"(AI{pressure.get('channel', 1)})"
+        )
+        self.apply_button.setEnabled(self._fit is not None)

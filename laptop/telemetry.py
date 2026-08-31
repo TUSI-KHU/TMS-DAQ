@@ -173,6 +173,20 @@ class TelemetryClient:
             )
         ).body
 
+    async def set_pressure_calibration(
+        self, *, scale_bar_per_count: float, offset_bar: float, timeout: float = 10.0
+    ) -> dict[str, Any]:
+        return (
+            await self._request(
+                MessageType.SET_PRESSURE_CALIBRATION,
+                {
+                    "scale_bar_per_count": scale_bar_per_count,
+                    "offset_bar": offset_bar,
+                },
+                timeout=timeout,
+            )
+        ).body
+
     async def start_session(
         self, test_name: str, timeout: float = 10.0
     ) -> dict[str, Any]:

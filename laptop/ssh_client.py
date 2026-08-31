@@ -61,6 +61,11 @@ class SshTunnelManager:
         return self._local_port
 
     async def connect(self) -> int:
+        # A telemetry socket can restart independently of sshd (for example
+        # when tms-agent is restarted during DAQ recovery).  Keep the healthy
+        # port-forward instead of tearing it down and creating SSH log noise.
+        if self.connected and self._listener is not None and self._local_port is not None:
+            return self._local_port
         await self.disconnect()
         self._status("CONNECTING")
         try:
@@ -94,6 +99,11 @@ class SshTunnelManager:
         return self.local_port
 
     async def disconnect(self) -> None:
+        was_connected = (
+            self._connection is not None
+            or self._listener is not None
+            or self._local_port is not None
+        )
         if self._listener is not None:
             self._listener.close()
             await self._listener.wait_closed()
@@ -103,7 +113,8 @@ class SshTunnelManager:
             self._connection.close()
             await self._connection.wait_closed()
         self._connection = None
-        self._status("DISCONNECTED")
+        if was_connected:
+            self._status("DISCONNECTED")
 
     async def recover_usb4704(self, *, timeout: float = 90.0) -> dict[str, object]:
         """Run the fixed root-only USB-4704 recovery helper over a new SSH channel.

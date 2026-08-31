@@ -88,6 +88,49 @@ class ChannelConfig:
 
 
 @dataclass(frozen=True)
+class PressureInputConfig:
+    """Electrical configuration for the fixed AI1 4–20 mA input.
+
+    The field wiring uses a 100 ohm shunt.  Keeping this separate from the
+    fitted bar/count calibration makes the electrical assumption explicit in
+    the dashboard and in each HDF5 log without changing the fitted pressure
+    coefficients.
+    """
+
+    shunt_ohms: float = 100.0
+    loop_min_mA: float = 4.0
+    loop_max_mA: float = 20.0
+
+    def __post_init__(self) -> None:
+        if not isfinite(self.shunt_ohms) or self.shunt_ohms <= 0.0:
+            raise ConfigError("pressure_input.shunt_ohms must be greater than zero")
+        if not isfinite(self.loop_min_mA) or not isfinite(self.loop_max_mA):
+            raise ConfigError("pressure_input loop current limits must be finite")
+        if self.loop_min_mA < 0.0 or self.loop_max_mA <= self.loop_min_mA:
+            raise ConfigError("pressure_input loop current limits are invalid")
+
+    @property
+    def signal_voltage_min_v(self) -> float:
+        return self.loop_min_mA / 1000.0 * self.shunt_ohms
+
+    @property
+    def signal_voltage_max_v(self) -> float:
+        return self.loop_max_mA / 1000.0 * self.shunt_ohms
+
+
+@dataclass(frozen=True)
+class LowPassConfig:
+    """Display/log filter settings for the calibrated sensor channels."""
+
+    enabled: bool = True
+    cutoff_hz: float = 50.0
+
+    def __post_init__(self) -> None:
+        if not isfinite(self.cutoff_hz) or self.cutoff_hz <= 0.0:
+            raise ConfigError("low_pass.cutoff_hz must be greater than zero")
+
+
+@dataclass(frozen=True)
 class DaqConfig:
     sample_rate: int = 5000
     block_ms: int = 10
@@ -131,6 +174,8 @@ class TmsConfig:
     system: SystemConfig = field(default_factory=SystemConfig)
     ssh: SshConfig = field(default_factory=SshConfig)
     nano: NanoConfig = field(default_factory=NanoConfig)
+    pressure_input: PressureInputConfig = field(default_factory=PressureInputConfig)
+    low_pass: LowPassConfig = field(default_factory=LowPassConfig)
 
     def __post_init__(self) -> None:
         if self.thrust.channel != THRUST_AI_CHANNEL:
@@ -147,6 +192,10 @@ class TmsConfig:
                 "DAQ sample rate multiplied by the contiguous channel scan count "
                 "must not exceed 47619 samples/s"
             )
+        if self.low_pass.enabled and self.low_pass.cutoff_hz >= self.daq.sample_rate / 2.0:
+            raise ConfigError(
+                "low_pass.cutoff_hz must be below the DAQ Nyquist frequency"
+            )
 
     def as_dict(self, *, include_secret: bool = False) -> dict[str, Any]:
         flat = asdict(self)
@@ -158,6 +207,8 @@ class TmsConfig:
             "nano": flat["nano"],
             "daq": flat["daq"],
             "channels": {"thrust": thrust, "pressure": pressure},
+            "pressure_input": flat["pressure_input"],
+            "low_pass": flat["low_pass"],
             "logging": flat["logging"],
         }
         result["logging"]["directory"] = str(self.logging.directory)
@@ -180,6 +231,8 @@ def default_config() -> TmsConfig:
             channel=SECOND_SENSOR_AI_CHANNEL, scale=0.001, offset=0.0
         ),
         logging=LoggingConfig(),
+        pressure_input=PressureInputConfig(),
+        low_pass=LowPassConfig(),
     )
 
 
@@ -207,6 +260,8 @@ def load_config(path: str | Path) -> TmsConfig:
     thrust = _mapping(channels.get("thrust", {}), "channels.thrust")
     pressure = _mapping(channels.get("pressure", {}), "channels.pressure")
     logging = _mapping(root.get("logging", {}), "logging")
+    pressure_input = _mapping(root.get("pressure_input", {}), "pressure_input")
+    low_pass = _mapping(root.get("low_pass", {}), "low_pass")
 
     try:
         return TmsConfig(
@@ -249,6 +304,15 @@ def load_config(path: str | Path) -> TmsConfig:
                 port=str(nano.get("port", "auto")),
                 baudrate=int(nano.get("baudrate", 115200)),
                 heartbeat_timeout_sec=float(nano.get("heartbeat_timeout_sec", 2.0)),
+            ),
+            pressure_input=PressureInputConfig(
+                shunt_ohms=float(pressure_input.get("shunt_ohms", 100.0)),
+                loop_min_mA=float(pressure_input.get("loop_min_mA", 4.0)),
+                loop_max_mA=float(pressure_input.get("loop_max_mA", 20.0)),
+            ),
+            low_pass=LowPassConfig(
+                enabled=bool(low_pass.get("enabled", True)),
+                cutoff_hz=float(low_pass.get("cutoff_hz", 50.0)),
             ),
         )
     except (TypeError, ValueError) as exc:

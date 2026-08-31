@@ -36,3 +36,5 @@ def test_log_listing_and_csv_export(tmp_path) -> None:
     assert len(rows) == 10
     assert float(rows[5]["time_s"]) == 0.0
     assert float(rows[2]["thrust_N"]) == 1.0
+    assert "thrust_N_lpf" in rows[0]
+    assert "pressure_bar_lpf" in rows[0]

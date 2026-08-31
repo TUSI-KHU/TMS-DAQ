@@ -2,14 +2,39 @@ import asyncio
 import threading
 
 import h5py
+import numpy as np
 import pytest
 
 from common.config import ChannelConfig, DaqConfig, LoggingConfig, TmsConfig
-from common.protocol import MessageType, WireMessage
+from common.protocol import MessageType, WireMessage, decode_daq_data
 from laptop.telemetry import HARDWARE_STOP_TIMEOUT_SECONDS, TelemetryClient
 from pi.daq import DaqBlock, DaqError, SimulatedDaqSource
 from pi.telemetry import TelemetryServer
 from pi.tms_agent import AgentState, TmsAgent
+
+
+def test_live_telemetry_uses_low_pass_values(tmp_path) -> None:
+    config = TmsConfig(
+        daq=DaqConfig(sample_rate=1_000, block_ms=10),
+        thrust=ChannelConfig(channel=0, scale=1.0, offset=0.0),
+        pressure=ChannelConfig(channel=1, scale=1.0, offset=0.0),
+        logging=LoggingConfig(directory=tmp_path),
+    )
+    source = SimulatedDaqSource(config.daq, (0, 1), realtime=False)
+    agent = TmsAgent(config, source)
+    server = TelemetryServer(agent, config)
+    block = DaqBlock(
+        sequence=0,
+        first_sample_index=0,
+        sample_rate=1_000,
+        channel_numbers=(0, 1),
+        raw_samples=np.asarray(((0, 0), (100, 100)), dtype=np.uint16),
+    )
+
+    decoded = decode_daq_data(server._telemetry_message(block))
+    assert decoded.values[0, 0] == 0.0
+    assert 0.0 < decoded.values[1, 0] < 100.0
+    assert decoded.values[1, 1] == decoded.values[1, 0]
 
 
 def test_tcp_session_survives_dashboard_disconnect(tmp_path) -> None:
@@ -121,6 +146,19 @@ def test_idle_calibration_capture_and_remote_ai0_persistence(tmp_path) -> None:
         assert saved["thrust"] == {"channel": 0, "scale": -0.25, "offset": 2500.0}
         assert agent.config.thrust == ChannelConfig(0, -0.25, 2500.0)
         assert persisted == [agent.config]
+
+        pressure_saved = await client.set_pressure_calibration(
+            scale_bar_per_count=0.0025,
+            offset_bar=-2.5,
+        )
+        assert pressure_saved["pressure"] == {
+            "channel": 1,
+            "scale": 0.0025,
+            "offset": -2.5,
+        }
+        assert agent.config.pressure == ChannelConfig(1, 0.0025, -2.5)
+        assert len(persisted) == 2
+        assert persisted[-1] == agent.config
 
         await client.disconnect()
         await server.close()

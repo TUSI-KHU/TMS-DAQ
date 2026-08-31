@@ -93,6 +93,17 @@ class BackendRuntime:
             self.signals.calibration_saved,
         )
 
+    def save_pressure_calibration(
+        self, *, scale_bar_per_count: float, offset_bar: float
+    ) -> None:
+        self._submit(
+            self._require_backend().set_pressure_calibration(
+                scale_bar_per_count=scale_bar_per_count,
+                offset_bar=offset_bar,
+            ),
+            self.signals.calibration_saved,
+        )
+
     def reset_daq(self) -> None:
         self._submit(self._require_backend().reset_daq(), self.signals.daq_reset_finished)
 

@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from common.config import TmsConfig
+from common.filtering import FirstOrderLowPass
 from common.protocol import (
     MessageType,
     ProtocolError,
@@ -37,6 +38,9 @@ IDLE_STREAM_POLL_INTERVAL_SEC = 0.01
 # dashboard's own request timeout, instead of later starting a stale session.
 START_SESSION_OPERATION_TIMEOUT_SEC = 8.0
 CALIBRATION_OPERATION_GRACE_SEC = 5.0
+POWER_DIAGNOSTIC_HINT = (
+    "Pi undervoltage 또는 USB 전원/케이블 불안정 여부를 확인하십시오."
+)
 
 
 @dataclass(eq=False)
@@ -154,9 +158,15 @@ class TelemetryServer:
     async def _command_loop(
         self, client: _Client, reader: asyncio.StreamReader
     ) -> None:
-        while True:
-            message = await read_message(reader)
-            await self._handle_command(client, message)
+        try:
+            while True:
+                message = await read_message(reader)
+                await self._handle_command(client, message)
+        except (asyncio.IncompleteReadError, ConnectionError):
+            # Dashboard/SSH tunnel teardown is a normal transport event. The
+            # outer client task closes the stream; do not emit an unhandled
+            # asyncio traceback that looks like an agent failure in journalctl.
+            return
 
     async def _handle_command(self, client: _Client, message: WireMessage) -> None:
         request_id = message.request_id
@@ -274,6 +284,33 @@ class TelemetryServer:
                             request_id=request_id,
                         )
                     )
+                elif message.message_type == MessageType.SET_PRESSURE_CALIBRATION:
+                    scale = float(message.body.get("scale_bar_per_count"))
+                    offset = float(message.body.get("offset_bar"))
+                    if not math.isfinite(scale) or not math.isfinite(offset):
+                        raise ProtocolError("calibration values must be finite")
+                    updated_config = self.agent.updated_pressure_calibration(
+                        scale_bar_per_count=scale,
+                        offset_bar=offset,
+                    )
+                    if self._config_update_callback is not None:
+                        self._config_update_callback(updated_config)
+                    self.agent.apply_idle_config(updated_config)
+                    self.config = updated_config
+                    await client.send(
+                        WireMessage(
+                            MessageType.ACK,
+                            {
+                                "command": MessageType.SET_PRESSURE_CALIBRATION.value,
+                                "pressure": {
+                                    "channel": updated_config.pressure.channel,
+                                    "scale": updated_config.pressure.scale,
+                                    "offset": updated_config.pressure.offset,
+                                },
+                            },
+                            request_id=request_id,
+                        )
+                    )
                 else:
                     raise ProtocolError(
                         f"unsupported command: {message.message_type.value}"
@@ -317,7 +354,8 @@ class TelemetryServer:
             raise DaqError(
                 "USB-4704 recovery is required after "
                 f"{self._hardware_recovery_required} timed out. "
-                "Run DAQ 초기화 before starting or calibrating again."
+                "Run DAQ 초기화 before starting or calibrating again. "
+                + POWER_DIAGNOSTIC_HINT
             )
 
         cancel_event = threading.Event()
@@ -337,7 +375,8 @@ class TelemetryServer:
             task.add_done_callback(self._consume_timed_out_command_result)
             raise DaqError(
                 f"USB-4704 {command_name} did not return within {timeout:.1f}s. "
-                "Run DAQ 초기화; a delayed command will not start a session."
+                "Run DAQ 초기화; a delayed command will not start a session. "
+                + POWER_DIAGNOSTIC_HINT
             ) from exc
 
     @staticmethod
@@ -353,6 +392,17 @@ class TelemetryServer:
     ) -> None:
         pending: list[DaqBlock] = []
         last_send = time.monotonic()
+        previous_block: DaqBlock | None = None
+        thrust_filter = FirstOrderLowPass(
+            self.config.daq.sample_rate,
+            self.config.low_pass.cutoff_hz,
+            self.config.low_pass.enabled,
+        )
+        pressure_filter = FirstOrderLowPass(
+            self.config.daq.sample_rate,
+            self.config.low_pass.cutoff_hz,
+            self.config.low_pass.enabled,
+        )
         while True:
             try:
                 block = subscriber.get_nowait()
@@ -366,7 +416,11 @@ class TelemetryServer:
                 now = time.monotonic()
                 if now - last_send >= TELEMETRY_BATCH_INTERVAL_SEC:
                     await client.send(
-                        self._telemetry_message(self._merge_blocks(pending))
+                        self._telemetry_message(
+                            self._merge_blocks(pending),
+                            thrust_filter=thrust_filter,
+                            pressure_filter=pressure_filter,
+                        )
                     )
                     pending.clear()
                     last_send = now
@@ -377,19 +431,33 @@ class TelemetryServer:
 
             # A dropped transport block must stay visible as an index gap in
             # the client. Do not concatenate it into a fabricated continuous
-            # trace.
-            if pending and not self._blocks_are_contiguous(pending[-1], block):
-                await client.send(
-                    self._telemetry_message(self._merge_blocks(pending))
-                )
-                pending.clear()
+            # trace, and restart the causal filter after the gap/session reset.
+            if previous_block is not None and not self._blocks_are_contiguous(
+                previous_block, block
+            ):
+                if pending:
+                    await client.send(
+                        self._telemetry_message(
+                            self._merge_blocks(pending),
+                            thrust_filter=thrust_filter,
+                            pressure_filter=pressure_filter,
+                        )
+                    )
+                    pending.clear()
+                thrust_filter.reset()
+                pressure_filter.reset()
                 last_send = time.monotonic()
+            previous_block = block
 
             pending.append(block)
             now = time.monotonic()
             if now - last_send >= TELEMETRY_BATCH_INTERVAL_SEC:
                 await client.send(
-                    self._telemetry_message(self._merge_blocks(pending))
+                    self._telemetry_message(
+                        self._merge_blocks(pending),
+                        thrust_filter=thrust_filter,
+                        pressure_filter=pressure_filter,
+                    )
                 )
                 pending.clear()
                 last_send = now
@@ -401,13 +469,31 @@ class TelemetryServer:
                 WireMessage(MessageType.HEALTH, self.agent.status_snapshot())
             )
 
-    def _telemetry_message(self, block: DaqBlock) -> WireMessage:
+    def _telemetry_message(
+        self,
+        block: DaqBlock,
+        *,
+        thrust_filter: FirstOrderLowPass | None = None,
+        pressure_filter: FirstOrderLowPass | None = None,
+    ) -> WireMessage:
         thrust = block.column_for_channel(self.config.thrust.channel).astype(np.float64)
         pressure = block.column_for_channel(self.config.pressure.channel).astype(
             np.float64
         )
         thrust = thrust * self.config.thrust.scale + self.config.thrust.offset
         pressure = pressure * self.config.pressure.scale + self.config.pressure.offset
+        thrust_filter = thrust_filter or FirstOrderLowPass(
+            self.config.daq.sample_rate,
+            self.config.low_pass.cutoff_hz,
+            self.config.low_pass.enabled,
+        )
+        pressure_filter = pressure_filter or FirstOrderLowPass(
+            self.config.daq.sample_rate,
+            self.config.low_pass.cutoff_hz,
+            self.config.low_pass.enabled,
+        )
+        thrust = thrust_filter.apply(thrust)
+        pressure = pressure_filter.apply(pressure)
         values = np.column_stack((thrust, pressure)).astype(np.float32)
         return make_daq_data_message(
             sequence=block.sequence,

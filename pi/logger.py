@@ -12,6 +12,7 @@ import h5py
 import numpy as np
 
 from common.config import TmsConfig
+from common.filtering import FirstOrderLowPass
 from pi.daq import DaqBlock
 
 SOFTWARE_VERSION = "0.1.0"
@@ -46,6 +47,8 @@ class Hdf5SessionLogger:
         self._expected_sample_index: int | None = None
         self._samples_written = 0
         self._last_flush = 0.0
+        self._thrust_filter: FirstOrderLowPass | None = None
+        self._pressure_filter: FirstOrderLowPass | None = None
 
     @property
     def path(self) -> Path:
@@ -65,6 +68,16 @@ class Hdf5SessionLogger:
         self._expected_sequence = None
         self._expected_sample_index = None
         self._samples_written = 0
+        self._thrust_filter = FirstOrderLowPass(
+            self._config.daq.sample_rate,
+            self._config.low_pass.cutoff_hz,
+            self._config.low_pass.enabled,
+        )
+        self._pressure_filter = FirstOrderLowPass(
+            self._config.daq.sample_rate,
+            self._config.low_pass.cutoff_hz,
+            self._config.low_pass.enabled,
+        )
         date = metadata.start_time[:10]
         name = safe_test_name(metadata.test_name)
         path = self._output_directory / f"{date}_{name}_{metadata.session_id}.h5"
@@ -85,6 +98,8 @@ class Hdf5SessionLogger:
             {
                 "thrust": config_data["channels"]["thrust"],
                 "pressure": config_data["channels"]["pressure"],
+                "pressure_input": config_data["pressure_input"],
+                "low_pass": config_data["low_pass"],
             },
             sort_keys=True,
         )
@@ -125,6 +140,20 @@ class Hdf5SessionLogger:
             ),
             "pressure_bar": samples.create_dataset(
                 "pressure_bar",
+                shape=(0,),
+                maxshape=(None,),
+                chunks=(chunk_samples,),
+                dtype="<f4",
+            ),
+            "thrust_N_lpf": samples.create_dataset(
+                "thrust_N_lpf",
+                shape=(0,),
+                maxshape=(None,),
+                chunks=(chunk_samples,),
+                dtype="<f4",
+            ),
+            "pressure_bar_lpf": samples.create_dataset(
+                "pressure_bar_lpf",
                 shape=(0,),
                 maxshape=(None,),
                 chunks=(chunk_samples,),
@@ -189,6 +218,10 @@ class Hdf5SessionLogger:
                 block.first_sample_index,
                 details=",".join(gap_details),
             )
+            if self._thrust_filter is not None:
+                self._thrust_filter.reset()
+            if self._pressure_filter is not None:
+                self._pressure_filter.reset()
 
         raw_thrust = block.column_for_channel(self._config.thrust.channel).astype(
             np.int32, copy=False
@@ -200,6 +233,10 @@ class Hdf5SessionLogger:
         thrust += self._config.thrust.offset
         pressure = raw_pressure.astype(np.float64) * self._config.pressure.scale
         pressure += self._config.pressure.offset
+        if self._thrust_filter is None or self._pressure_filter is None:
+            raise RuntimeError("low-pass filters are not initialized")
+        thrust_lpf = self._thrust_filter.apply(thrust)
+        pressure_lpf = self._pressure_filter.apply(pressure)
         sample_indices = np.arange(
             block.first_sample_index,
             block.first_sample_index + block.sample_count,
@@ -214,6 +251,8 @@ class Hdf5SessionLogger:
             "raw_pressure": raw_pressure,
             "thrust_N": thrust.astype(np.float32),
             "pressure_bar": pressure.astype(np.float32),
+            "thrust_N_lpf": thrust_lpf.astype(np.float32),
+            "pressure_bar_lpf": pressure_lpf.astype(np.float32),
         }
         for name, data in values.items():
             dataset = self._datasets[name]

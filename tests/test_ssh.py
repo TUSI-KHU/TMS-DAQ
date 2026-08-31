@@ -92,6 +92,26 @@ def test_ssh_uses_password_only_and_local_forward(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_ssh_connect_reuses_a_healthy_forward(monkeypatch) -> None:
+    async def scenario() -> None:
+        calls = 0
+        connection = FakeConnection()
+
+        async def fake_connect(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return connection
+
+        monkeypatch.setattr(asyncssh, "connect", fake_connect)
+        manager = SshTunnelManager(SystemConfig(), SshConfig())
+        assert await manager.connect() == 32100
+        assert await manager.connect() == 32100
+        assert calls == 1
+        await manager.disconnect()
+
+    asyncio.run(scenario())
+
+
 def test_remote_logs_are_sorted_by_modification_time() -> None:
     class FakeSftp:
         async def __aenter__(self):

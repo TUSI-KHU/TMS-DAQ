@@ -38,6 +38,15 @@ warn() {
     log "WARNING: $*"
 }
 
+warn_if_undervoltage_recorded() {
+    if ! command -v journalctl >/dev/null 2>&1; then
+        return 0
+    fi
+    if journalctl -k -b --no-pager -q 2>/dev/null | grep -q "Undervoltage detected"; then
+        warn "Pi kernel recorded undervoltage; use a rated Pi supply and powered USB hub before retrying calibration"
+    fi
+}
+
 start_agent_if_needed() {
     if (( restart_agent_on_exit )); then
         log "restoring $service_name after interrupted recovery"
@@ -51,6 +60,8 @@ command -v "$systemctl_bin" >/dev/null 2>&1 || {
     log "ERROR: systemctl is unavailable"
     exit 2
 }
+
+warn_if_undervoltage_recorded
 
 service_main_pid() {
     "$systemctl_bin" show -p MainPID --value "$service_name" 2>/dev/null || true

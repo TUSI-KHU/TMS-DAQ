@@ -22,7 +22,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-# The dashboard persists only the fitted AI0 scale/offset here through the
+# The dashboard persists only the fitted AI0/AI1 scale/offset here through the
 # local-only telemetry service; all other system paths remain read-only.
 ReadWritePaths=/var/lib/tusi-tms /etc/tusi-tms
 

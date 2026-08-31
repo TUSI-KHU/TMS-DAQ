@@ -20,6 +20,11 @@ def test_example_configuration_loads() -> None:
     assert config.daq.samples_per_block == 50
     assert config.thrust.channel == 0
     assert config.pressure.channel == 1
+    assert config.pressure_input.shunt_ohms == 100.0
+    assert config.pressure_input.signal_voltage_min_v == pytest.approx(0.4)
+    assert config.pressure_input.signal_voltage_max_v == pytest.approx(2.0)
+    assert config.low_pass.enabled is True
+    assert config.low_pass.cutoff_hz == 50.0
     assert config.system.telemetry_port == 29100
 
 
@@ -28,6 +33,8 @@ def test_default_configuration_matches_first_run_channels() -> None:
 
     assert config.thrust.channel == 0
     assert config.pressure.channel == 1
+    assert config.pressure_input.shunt_ohms == 100.0
+    assert config.low_pass.cutoff_hz == 50.0
     assert config.daq.sample_rate == 5000
 
 

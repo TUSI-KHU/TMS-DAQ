@@ -72,6 +72,7 @@ class DashboardBackend:
         self.nano.start()
         delays = (1.0, 2.0, 5.0, 10.0)
         attempt = 0
+        tunnel_failures = 0
         try:
             while not self._stop_event.is_set():
                 try:
@@ -86,6 +87,7 @@ class DashboardBackend:
                         await self.telemetry.connect("127.0.0.1", local_port)
                     self._connection("Pi", "CONNECTED")
                     attempt = 0
+                    tunnel_failures = 0
                     self._block_task = asyncio.create_task(self._consume_blocks())
                     self._health_task = asyncio.create_task(self._report_health())
                     await self.telemetry.wait_connection_lost()
@@ -96,6 +98,7 @@ class DashboardBackend:
                         self._connection("SSH", "AUTHENTICATION_FAILED")
                         return
                 except TelemetryError as exc:
+                    tunnel_failures += 1
                     if not self._daq_recovery_in_progress:
                         self._error(str(exc))
                 finally:
@@ -110,7 +113,12 @@ class DashboardBackend:
                         with contextlib.suppress(asyncio.CancelledError):
                             await self._health_task
                     self._health_task = None
-                    if not self.direct_telemetry:
+                    # Keep SSH alive across a tms-agent/DAQ restart.  A
+                    # repeated failure on the same forward means the SSH
+                    # transport itself is stale, so rotate it then.
+                    if not self.direct_telemetry and (
+                        not self.ssh.connected or tunnel_failures >= 3
+                    ):
                         await self.ssh.disconnect()
                     self._connection("Pi", "RECONNECTING")
 
@@ -149,6 +157,14 @@ class DashboardBackend:
         return await self.telemetry.set_thrust_calibration(
             scale_N_per_count=scale_N_per_count,
             offset_N=offset_N,
+        )
+
+    async def set_pressure_calibration(
+        self, *, scale_bar_per_count: float, offset_bar: float
+    ) -> dict[str, Any]:
+        return await self.telemetry.set_pressure_calibration(
+            scale_bar_per_count=scale_bar_per_count,
+            offset_bar=offset_bar,
         )
 
     async def reset_daq(self) -> dict[str, object]:

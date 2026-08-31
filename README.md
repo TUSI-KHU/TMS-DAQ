@@ -78,6 +78,12 @@ agent는 재시작하지 않는다. Pi는 유선 링크가
   프로그램/파이프라인 상태, 측정 시작·종료·설정 바로가기
 - 각 실시간 graph의 데이터 상자에서 추력·압력 등 수신 channel을 선택하면
   단위, 현재값, 세션 피크, 최근 10초 범위와 graph가 함께 변경
+- 50 Hz 1차 저역통과필터(LPF)를 실시간 화면과 로그의 별도 필터 dataset에 적용
+  하며, `raw_*`와 비필터 물리값은 원본으로 함께 보존
+- 측정 전 AI0 로드셀과 AI1 압력 채널에 대해 알려진 기준점 2개 또는 3개를
+  취득하는 원점/게인 캘리브레이션 UI와 Pi 설정 저장 경로
+- Pi agent가 재시작되는 동안 정상 SSH local tunnel을 유지하고, 반복 실패 때만
+  tunnel을 교체하여 DAQ 복구 시 연결 깜빡임을 줄이는 재연결 정책
 - HDF5 session 조회, CSV 내보내기 및 SFTP Pi 로그 가져오기
 - Pi systemd service, 설치 스크립트 및 Dashboard PyInstaller 설정
 
@@ -107,6 +113,8 @@ Pi 로그 파일에는 다음 구조가 생성된다.
 /samples/raw_pressure
 /samples/thrust_N
 /samples/pressure_bar
+/samples/thrust_N_lpf
+/samples/pressure_bar_lpf
 /events
 /health
 ```
@@ -199,6 +207,14 @@ sudo apt install python3-venv \
 ```
 
 결과는 `dist/TUSI-TMS` 또는 `dist/TUSI-TMS.exe`에 생성된다.
+
+Linux 번들의 NumPy/캘리브레이션 압축 아카이브까지 확인하려면:
+
+```bash
+./dist/TUSI-TMS --self-test
+```
+
+`TUSI-TMS self-test: calibration path OK`가 출력되어야 한다.
 
 ## Nano firmware 빌드
 

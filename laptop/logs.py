@@ -86,6 +86,10 @@ def export_csv(
             for name in required:
                 if name not in samples:
                     raise LogError(f"missing HDF5 dataset: /samples/{name}")
+            # Logs written before LPF support remain exportable; their
+            # unfiltered physical values are used as a compatibility fallback.
+            thrust_lpf = samples.get("thrust_N_lpf", samples["thrust_N"])
+            pressure_lpf = samples.get("pressure_bar_lpf", samples["pressure_bar"])
             sample_rate = float(data["metadata"].attrs["sample_rate"])
             summary = read_session_summary(source_path)
             writer = csv.writer(output)
@@ -97,6 +101,8 @@ def export_csv(
                     "raw_pressure",
                     "thrust_N",
                     "pressure_bar",
+                    "thrust_N_lpf",
+                    "pressure_bar_lpf",
                 )
             )
             count = len(samples["sample_index"])
@@ -114,6 +120,8 @@ def export_csv(
                     samples["raw_pressure"][start:end],
                     samples["thrust_N"][start:end],
                     samples["pressure_bar"][start:end],
+                    thrust_lpf[start:end],
+                    pressure_lpf[start:end],
                 )
                 writer.writerows(rows)
     except LogError:

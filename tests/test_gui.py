@@ -3,11 +3,12 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
 from PySide6.QtWidgets import QApplication, QComboBox, QGroupBox, QLineEdit, QTabWidget
 
 from common.config import ChannelConfig, DaqConfig, LoggingConfig, TmsConfig
 from common.protocol import TelemetryBlock
-from laptop.gui.calibration_dialog import LoadCellCalibrationDialog
+from laptop.gui.calibration_dialog import LoadCellCalibrationDialog, PressureCalibrationDialog
 from laptop.gui.main_window import MainWindow, PLOT_HISTORY_SECONDS, PLOT_MAX_POINTS
 
 
@@ -200,4 +201,33 @@ def test_load_cell_calibration_dialog_collects_two_points_and_fits() -> None:
     dialog.point_count.setCurrentIndex(1)
     app.processEvents()
     assert dialog.reference_table.rowCount() == 3
+    dialog.close()
+
+
+def test_pressure_calibration_dialog_collects_ai1_points_and_fits() -> None:
+    app = QApplication.instance() or QApplication([])
+    dialog = PressureCalibrationDialog(current_scale=0.001, current_offset=0.0)
+    assert dialog.reference_table.rowCount() == 2
+    assert "100 Ω" in dialog.layout().itemAt(0).widget().text()
+    assert "0.400 V" in dialog.layout().itemAt(0).widget().text()
+    dialog._request_capture(0)
+    dialog.record_capture(
+        {
+            "_ui_row": 0,
+            "channels": {"ai1": {"sample_count": 5000, "mean": 1000.0, "stddev": 2.0}},
+        }
+    )
+    dialog._request_capture(1)
+    dialog.record_capture(
+        {
+            "_ui_row": 1,
+            "channels": {"ai1": {"sample_count": 5000, "mean": 3000.0, "stddev": 2.0}},
+        }
+    )
+    assert "mA" in dialog._mean_labels[1].text()
+    dialog._mass_fields[1].setValue(10.0)
+    dialog._calculate()
+    assert dialog._fit is not None
+    assert dialog._fit.scale_bar_per_count == pytest.approx(0.005)
+    assert dialog.apply_button.isEnabled()
     dialog.close()

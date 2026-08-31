@@ -21,11 +21,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="connect directly without SSH for local development only",
     )
     parser.add_argument("--direct-host", default="127.0.0.1")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="validate bundled NumPy/calibration code and exit",
+    )
     return parser
+
+
+def _run_self_test() -> int:
+    """Exercise the lazy NumPy imports used by the calibration path."""
+
+    from laptop.calibration import PressureCalibrationReference, fit_pressure_calibration
+
+    fit_pressure_calibration(
+        (
+            PressureCalibrationReference(0.0, 9000.0, 0.0, 100),
+            PressureCalibrationReference(10.0, 10000.0, 0.0, 100),
+        )
+    )
+    print("TUSI-TMS self-test: calibration path OK")
+    return 0
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.self_test:
+        return _run_self_test()
     config_path = Path(args.config)
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parents[1]))
     example_path = bundle_root / "config.example.yaml"

@@ -30,6 +30,20 @@ channels:
     scale: 0.001
     offset: 0.0
 
+# AI1 pressure transmitter electrical input. The field wiring uses a 100 Ω
+# shunt: 4–20 mA becomes 0.4–2.0 V at the USB-4704 AI1 input. The pressure
+# scale/offset above are still fitted from known reference pressures.
+pressure_input:
+  shunt_ohms: 100.0
+  loop_min_mA: 4.0
+  loop_max_mA: 20.0
+
+# Causal one-pole LPF applied to live telemetry and additional *_lpf datasets.
+# Existing raw_* and unfiltered physical datasets are retained unchanged.
+low_pass:
+  enabled: true
+  cutoff_hz: 50.0
+
 logging:
   directory: logs
   pi_directory: /var/lib/tusi-tms/logs

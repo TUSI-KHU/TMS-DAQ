@@ -24,7 +24,7 @@ if [[ ! -e "${PACKAGE_SOURCE}" ]]; then
 fi
 
 install -d -m 0755 "${INSTALL_ROOT}"
-# The unprivileged tms-agent atomically persists only fitted AI0 calibration
+# The unprivileged tms-agent atomically persists fitted AI0/AI1 calibration
 # values, so it needs to create a temporary file beside config.yaml.
 install -d -o tms -g tms -m 0750 "${CONFIG_ROOT}"
 install -d -m 0755 "${INSTALL_ROOT}/bin"
