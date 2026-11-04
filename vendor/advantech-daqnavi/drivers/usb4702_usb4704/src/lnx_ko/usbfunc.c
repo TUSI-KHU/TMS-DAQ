@@ -39,6 +39,9 @@ int __daq_usb_control_in_idx(daq_device_t *daq_dev, __u8 major, __u16 minor, __u
    if (ret > 0) {
       memcpy(data, daq_dev->ctrl_xfer_buff, size);
    }
+   if (ret < 0) {
+      dev_warn_ratelimited(&daq_dev->udev->dev, "control IN request=%02x value=%04x index=%04x failed: %d\n", major, minor, idx, ret);
+   }
 
    return ret;
 }
@@ -52,14 +55,19 @@ int __daq_usb_control_in(daq_device_t *daq_dev, __u8 major, __u16 minor, void *d
 static inline
 int __daq_usb_control_out_idx(daq_device_t *daq_dev, __u8 major, __u16 minor, __u16 idx, void *data, __u16 size)
 {
+   int ret;
    if (WARN(size > CTRL_XFER_MAXLEN, "Control transfer length exceeds the limiation")) {
       return -EINVAL;
    }
 
    memcpy(daq_dev->ctrl_xfer_buff, data, size);
-   return usb_control_msg(daq_dev->udev, usb_sndctrlpipe(daq_dev->udev, 0),
+   ret = usb_control_msg(daq_dev->udev, usb_sndctrlpipe(daq_dev->udev, 0),
             major, USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
             minor, idx, daq_dev->ctrl_xfer_buff, size,  USB_CTRL_SET_TIMEOUT);
+   if (ret < 0) {
+      dev_warn_ratelimited(&daq_dev->udev->dev, "control OUT request=%02x value=%04x index=%04x failed: %d\n", major, minor, idx, ret);
+   }
+   return ret;
 }
 
 static inline
@@ -380,4 +388,3 @@ int daq_usb_cntr_read_event_count(daq_device_t *daq_dev, __u32 counter, __u32 *c
 
    return ret;
 }
-

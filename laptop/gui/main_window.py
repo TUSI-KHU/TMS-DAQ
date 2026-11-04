@@ -7,28 +7,35 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QUrl
-from PySide6.QtGui import QCloseEvent, QDesktopServices
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -52,15 +59,16 @@ from laptop.gui.calibration_dialog import (
     PressureCalibrationDialog,
 )
 from laptop.gui.runtime import BackendRuntime, BackendSignals
-from laptop.logs import LogError, export_csv, list_sessions
+from laptop.gui.theme import AMBER, CYAN, MUTED, PLOT, apply_theme
+from laptop.logs import list_sessions
 from laptop.operator_defaults import apply_field_connection
 from laptop.system_test import SystemTestResult
 
 STATUS_COLORS = {
-    "GREEN": "#24a148",
-    "YELLOW": "#f1c21b",
-    "RED": "#da1e28",
-    "GRAY": "#8d8d8d",
+    "GREEN": "#87d99b",
+    "YELLOW": "#ffc43d",
+    "RED": "#ff898d",
+    "GRAY": "#afb4bf",
 }
 
 
@@ -87,8 +95,8 @@ class SignalPanel:
 
 
 CHANNEL_DISPLAYS: dict[str, ChannelDisplay] = {
-    "thrust_N": ChannelDisplay("추력 (LPF)", "N", "#0f62fe", 2),
-    "pressure_bar": ChannelDisplay("압력 (LPF)", "bar", "#8a3ffc", 3),
+    "thrust_N": ChannelDisplay("추력", "N", CYAN, 2),
+    "pressure_bar": ChannelDisplay("압력", "bar", AMBER, 3),
     "raw_thrust": ChannelDisplay("추력 원시값", "ADC", "#42be65", 0),
     "raw_pressure": ChannelDisplay("압력 원시값", "ADC", "#ff832b", 0),
 }
@@ -117,7 +125,9 @@ class MainWindow(QMainWindow):
         self.config_path = config_path
         self.direct_telemetry = direct_telemetry
         self.setWindowTitle("TUSI TMS")
-        self.resize(1180, 850)
+        self.resize(1440, 940)
+        self.setMinimumSize(1100, 760)
+        apply_theme(self)
         # Anti-aliasing is disproportionately expensive for continuously
         # redrawn time-series curves and does not improve operator readability
         # at the dashboard's live update rate.
@@ -141,35 +151,163 @@ class MainWindow(QMainWindow):
         self._sessions = []
         self._calibration_dialog: LoadCellCalibrationDialog | PressureCalibrationDialog | None = None
         self._daq_reset_in_progress = False
+        self._session_operation: str | None = None
+        self._agent_state = "DISCONNECTED"
+        self._active_session_id: str | None = None
+        self._daq_recovery_required = False
+        self._error_dialog: QMessageBox | None = None
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard(), "Dashboard")
         self.tabs.addTab(self._build_setup(), "Setup")
         self.tabs.addTab(self._build_system_test(), "System Test")
         self.tabs.addTab(self._build_logs(), "Logs")
-        self.setCentralWidget(self.tabs)
+        self.tabs.tabBar().hide()
+        self.setCentralWidget(self._build_workspace())
         self._connect_signals()
         self._start_runtime()
         self._refresh_logs()
 
+    def _build_workspace(self) -> QWidget:
+        shell = QWidget()
+        shell.setObjectName("workspace-shell")
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QFrame()
+        header.setObjectName("app-header")
+        header.setFixedHeight(48)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(20, 0, 20, 0)
+        title = QLabel("TUSI / TMS")
+        title.setObjectName("app-title")
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        section = QLabel("계측")
+        section.setObjectName("app-section")
+        header_layout.addWidget(section)
+        layout.addWidget(header)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(210)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(8, 12, 8, 10)
+        sidebar_layout.setSpacing(4)
+        outline = QLabel("작업")
+        outline.setObjectName("sidebar-title")
+        sidebar_layout.addWidget(outline)
+        self.navigation = QTreeWidget()
+        self.navigation.setObjectName("navigation")
+        self.navigation.setHeaderHidden(True)
+        self.navigation.setIndentation(17)
+        self.navigation.setRootIsDecorated(True)
+        self.navigation.setUniformRowHeights(True)
+        self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._navigation_pages: dict[int, QTreeWidgetItem] = {}
+        live = QTreeWidgetItem(self.navigation, ["실시간 계측"])
+        live.setData(0, Qt.ItemDataRole.UserRole, 0)
+        self._navigation_pages[0] = live
+        for heading, entries in (
+            ("설정", (("수집 · 연결", 1), ("로드셀 보정", "thrust"), ("압력 보정", "pressure"))),
+            ("진단", (("시스템 점검", 2),)),
+            ("기록", (("시험 로그", 3),)),
+        ):
+            parent = QTreeWidgetItem(self.navigation, [heading])
+            parent.setFlags(parent.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            for label, target in entries:
+                item = QTreeWidgetItem(parent, [label])
+                item.setData(0, Qt.ItemDataRole.UserRole, target)
+                if isinstance(target, int):
+                    self._navigation_pages[target] = item
+            parent.setExpanded(True)
+        self.navigation.setCurrentItem(live)
+        self.navigation.itemClicked.connect(self._navigate)
+        sidebar_layout.addWidget(self.navigation, 1)
+        body.addWidget(sidebar)
+
+        workspace = QWidget()
+        workspace.setObjectName("workspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(0)
+        toolbar = QFrame()
+        toolbar.setObjectName("workspace-toolbar")
+        toolbar.setFixedHeight(46)
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(18, 0, 18, 0)
+        self.page_title = QLabel("실시간 계측")
+        self.page_title.setObjectName("page-title")
+        toolbar_layout.addWidget(self.page_title)
+        toolbar_layout.addStretch()
+        device = QLabel("USB-4704")
+        device.setObjectName("workspace-device")
+        toolbar_layout.addWidget(device)
+        workspace_layout.addWidget(toolbar)
+        workspace_layout.addWidget(self.tabs, 1)
+
+        # Keep the live console one click away without filling the work area
+        # with repetitive transport messages or permanent explanatory text.
+        self.console_toggle = QPushButton("▸ 콘솔")
+        self.console_toggle.setObjectName("console-toggle")
+        self.console_toggle.setCheckable(True)
+        self.console_toggle.toggled.connect(self._toggle_console)
+        workspace_layout.addWidget(self.console_toggle)
+        self.event_console = QTextEdit()
+        self.event_console.setObjectName("event-console")
+        self.event_console.setReadOnly(True)
+        self.event_console.document().setMaximumBlockCount(500)
+        self.event_console.setFixedHeight(145)
+        self.event_console.hide()
+        workspace_layout.addWidget(self.event_console)
+        body.addWidget(workspace, 1)
+        layout.addLayout(body, 1)
+        self.tabs.currentChanged.connect(self._workspace_page_changed)
+        return shell
+
+    def _navigate(self, item: QTreeWidgetItem, _column: int) -> None:
+        target = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(target, int):
+            self.tabs.setCurrentIndex(target)
+        elif target == "thrust":
+            self._open_calibration()
+            self._workspace_page_changed(self.tabs.currentIndex())
+        elif target == "pressure":
+            self._open_pressure_calibration()
+            self._workspace_page_changed(self.tabs.currentIndex())
+
+    def _workspace_page_changed(self, index: int) -> None:
+        item = self._navigation_pages.get(index)
+        if item is not None:
+            self.navigation.setCurrentItem(item)
+            self.page_title.setText(item.text(0))
+
+    def _toggle_console(self, expanded: bool) -> None:
+        self.event_console.setVisible(expanded)
+        self.console_toggle.setText("▾ 콘솔" if expanded else "▸ 콘솔")
+
     def _build_dashboard(self) -> QWidget:
         page = QWidget()
+        page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         layout = QVBoxLayout(page)
-        title = QLabel("TUSI TMS · 통합 계측 콘솔")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; padding: 4px 0;")
-        layout.addWidget(title)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        layout.setContentsMargins(14, 8, 14, 8)
 
         grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(12)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
         grid.addWidget(self._build_signal_panel(0, DEFAULT_LIVE_CHANNELS[0]), 0, 0)
         grid.addWidget(self._build_signal_panel(1, DEFAULT_LIVE_CHANNELS[1]), 0, 1)
         grid.addWidget(self._build_pipeline_status_panel(), 1, 0)
         grid.addWidget(self._build_session_control_panel(), 1, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
-        grid.setRowStretch(0, 3)
-        grid.setRowStretch(1, 2)
+        grid.setRowStretch(0, 5)
+        grid.setRowStretch(1, 3)
         layout.addLayout(grid, 1)
 
         # These aliases keep the original public widget names usable for
@@ -182,48 +320,68 @@ class MainWindow(QMainWindow):
         self.peak_thrust = self._signal_panels[0].peak
         self.current_pressure = self._signal_panels[1].current
         self.peak_pressure = self._signal_panels[1].peak
-        return page
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        return scroll
 
     def _build_signal_panel(self, index: int, default_channel: str) -> QGroupBox:
-        box = QGroupBox(f"실시간 데이터 {index + 1}")
+        box = QGroupBox(f"신호 {index + 1:02d}")
         box.setObjectName(f"live-data-panel-{index}")
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(10, 6, 10, 8)
 
         selection = QHBoxLayout()
-        selection.addWidget(QLabel("표시 데이터"))
         selector = QComboBox()
         selector.setObjectName(f"signal-selector-{index}")
         for channel_name in DEFAULT_LIVE_CHANNELS:
             selector.addItem(self._channel_option_label(channel_name), channel_name)
         selector.setCurrentIndex(max(0, selector.findData(default_channel)))
-        selection.addWidget(selector, 1)
+        selector.setMinimumWidth(170)
+        selection.addWidget(selector)
+        selection.addStretch()
         layout.addLayout(selection)
 
+        metrics = QHBoxLayout()
+        current = QLabel("--")
+        peak = QLabel("--")
+        range_label = QLabel(box)
+        range_label.hide()
+        for caption, value in (("현재값", current), ("세션 최대", peak)):
+            column = QVBoxLayout()
+            column.setSpacing(0)
+            label = QLabel(caption)
+            label.setProperty("role", "metric-caption")
+            value.setProperty("role", "metric")
+            column.addWidget(label)
+            column.addWidget(value)
+            metrics.addLayout(column, 1)
+        layout.addLayout(metrics)
+
         plot = pg.PlotWidget()
-        plot.setMinimumHeight(235)
-        plot.showGrid(x=True, y=True, alpha=0.22)
+        plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        plot.setBackground(PLOT)
+        plot.setMinimumHeight(125)
+        plot.showGrid(x=True, y=True, alpha=0.14)
+        plot.setMenuEnabled(False)
+        plot.hideButtons()
+        for position in ("left", "bottom"):
+            axis = plot.getAxis(position)
+            axis.setPen(pg.mkPen("#646975"))
+            axis.setTextPen(pg.mkPen(MUTED))
+            tick_font = QFont("Noto Sans", 10)
+            tick_font.setPixelSize(13)
+            axis.setTickFont(tick_font)
+        plot.getAxis("left").setWidth(78)
+        plot.getAxis("bottom").setHeight(44)
         # Keep the operator-facing clock in plain seconds.  Otherwise
         # pyqtgraph abbreviates an accidentally large sample index as Ts/Ys.
         plot.getAxis("bottom").enableAutoSIPrefix(False)
         plot.setXRange(0.0, PLOT_HISTORY_SECONDS, padding=0.0)
-        curve = plot.plot(pen=pg.mkPen("#0f62fe", width=2))
+        curve = plot.plot(pen=pg.mkPen(CYAN, width=2))
         curve.setClipToView(True)
         curve.setDownsampling(auto=True, method="peak")
         layout.addWidget(plot, 1)
-
-        metrics = QGridLayout()
-        current = QLabel("--")
-        peak = QLabel("--")
-        range_label = QLabel("Y축 자동 범위: --")
-        for value in (current, peak):
-            value.setStyleSheet("font-size: 19px; font-weight: bold;")
-        range_label.setStyleSheet("color: #525252;")
-        metrics.addWidget(QLabel("현재값"), 0, 0)
-        metrics.addWidget(QLabel("세션 최대"), 0, 1)
-        metrics.addWidget(current, 1, 0)
-        metrics.addWidget(peak, 1, 1)
-        metrics.addWidget(range_label, 2, 0, 1, 2)
-        layout.addLayout(metrics)
 
         panel = SignalPanel(selector, plot, curve, current, peak, range_label)
         self._signal_panels.append(panel)
@@ -236,29 +394,26 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_pipeline_status_panel(self) -> QGroupBox:
-        status_box = QGroupBox("프로그램 / 파이프라인 상태")
+        status_box = QGroupBox("시스템 상태")
         status_layout = QVBoxLayout(status_box)
+        status_layout.setContentsMargins(10, 6, 10, 8)
 
         self.state_label = QLabel("STATUS: DISCONNECTED")
-        self.state_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        self.state_label.setObjectName("session-state")
         status_layout.addWidget(self.state_label)
 
-        self.pipeline_summary = QLabel(
-            "SSH 터널과 Pi telemetry 연결을 기다리는 중입니다."
-        )
-        self.pipeline_summary.setWordWrap(True)
-        self.pipeline_summary.setStyleSheet("color: #525252;")
-        status_layout.addWidget(self.pipeline_summary)
+        self.pipeline_summary = QLabel(status_box)
+        self.pipeline_summary.hide()
 
         acquisition = QGridLayout()
         self.sample_rate = QLabel("-- S/s")
         self.t_plus = QLabel("Pre-trigger")
-        self.data_window = QLabel("최근 데이터: --")
+        self.data_window = QLabel("-- samples")
         for value in (self.sample_rate, self.t_plus, self.data_window):
             value.setStyleSheet("font-weight: bold;")
-        acquisition.addWidget(QLabel("Sample Rate"), 0, 0)
+        acquisition.addWidget(QLabel("취득 속도"), 0, 0)
         acquisition.addWidget(QLabel("T+"), 0, 1)
-        acquisition.addWidget(QLabel("Buffer"), 0, 2)
+        acquisition.addWidget(QLabel("버퍼"), 0, 2)
         acquisition.addWidget(self.sample_rate, 1, 0)
         acquisition.addWidget(self.t_plus, 1, 1)
         acquisition.addWidget(self.data_window, 1, 2)
@@ -269,23 +424,25 @@ class MainWindow(QMainWindow):
             ("Nano", "LAN", "SSH", "Pi", "DAQ", "Logger", "Disk")
         ):
             label = QLabel()
+            label.setMinimumHeight(32)
             self._status_labels[name] = label
             self._set_status(name, "Inactive", "GRAY")
             row, column = divmod(index, 3)
             component_layout.addWidget(label, row, column)
         status_layout.addLayout(component_layout)
 
-        self.pipeline_message = QLabel("최근 이벤트: 없음")
+        self.pipeline_message = QLabel("")
         self.pipeline_message.setWordWrap(True)
-        self.pipeline_message.setStyleSheet(
-            "background: #f4f4f4; border-radius: 4px; padding: 7px; color: #393939;"
-        )
+        self.pipeline_message.setObjectName("pipeline-event")
+        self.pipeline_message.setMaximumHeight(52)
         status_layout.addWidget(self.pipeline_message)
+        status_layout.addStretch()
         return status_box
 
     def _build_session_control_panel(self) -> QGroupBox:
-        box = QGroupBox("측정 제어 / 설정")
+        box = QGroupBox("측정 제어")
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(10, 6, 10, 8)
 
         self.test_name = QLineEdit("KNSB_TEST_001")
         self.test_name.setPlaceholderText("시험명")
@@ -294,8 +451,12 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         self.start_button = QPushButton("측정 준비")
+        self.start_button.setProperty("role", "primary")
+        self.start_button.setMinimumHeight(30)
         self.start_button.setEnabled(False)
         self.stop_button = QPushButton("측정 종료")
+        self.stop_button.setProperty("role", "stop")
+        self.stop_button.setMinimumHeight(30)
         self.stop_button.setEnabled(False)
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
@@ -305,13 +466,15 @@ class MainWindow(QMainWindow):
         self.calibration_button.setToolTip(
             "실행 전 AI0 원시값을 취득해 2점 또는 3점 질량 보정을 저장합니다"
         )
-        layout.addWidget(self.calibration_button)
 
         self.pressure_calibration_button = QPushButton("AI1 압력 보정")
         self.pressure_calibration_button.setToolTip(
             "실행 전 AI1 원시값을 취득해 2점 또는 3점 기준압력 보정을 저장합니다"
         )
-        layout.addWidget(self.pressure_calibration_button)
+        calibrations = QHBoxLayout()
+        calibrations.addWidget(self.calibration_button)
+        calibrations.addWidget(self.pressure_calibration_button)
+        layout.addLayout(calibrations)
 
         self.daq_reset_button = QPushButton("DAQ 초기화")
         self.daq_reset_button.setEnabled(False)
@@ -320,29 +483,6 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.daq_reset_button)
 
-        self.quick_settings_summary = QLabel()
-        self.quick_settings_summary.setWordWrap(True)
-        self.quick_settings_summary.setStyleSheet(
-            "background: #edf5ff; border-radius: 4px; padding: 7px; color: #0043ce;"
-        )
-        layout.addWidget(self.quick_settings_summary)
-        self._update_quick_settings_summary()
-
-        navigation = QHBoxLayout()
-        setup_button = QPushButton("설정 열기")
-        system_test_button = QPushButton("시스템 점검")
-        logs_button = QPushButton("로그")
-        navigation.addWidget(setup_button)
-        navigation.addWidget(system_test_button)
-        navigation.addWidget(logs_button)
-        layout.addLayout(navigation)
-
-        safety_note = QLabel(
-            "측정 준비는 Pi 수집 세션만 시작합니다. Trigger/AO/DO 동작은 이 화면에서 실행하지 않습니다."
-        )
-        safety_note.setWordWrap(True)
-        safety_note.setStyleSheet("color: #6f6f6f;")
-        layout.addWidget(safety_note)
         layout.addStretch(1)
 
         self.start_button.clicked.connect(self._start_session)
@@ -350,9 +490,6 @@ class MainWindow(QMainWindow):
         self.calibration_button.clicked.connect(self._open_calibration)
         self.pressure_calibration_button.clicked.connect(self._open_pressure_calibration)
         self.daq_reset_button.clicked.connect(self._reset_daq)
-        setup_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
-        system_test_button.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
-        logs_button.clicked.connect(lambda: self.tabs.setCurrentIndex(3))
         return box
 
     @staticmethod
@@ -392,10 +529,13 @@ class MainWindow(QMainWindow):
         if not channel_name:
             return
         display = self._channel_display(channel_name)
-        panel.plot.setTitle(f"{display.label} · Y축 자동 범위")
-        panel.plot.setLabel("left", display.label, units=display.unit)
-        panel.plot.setLabel("bottom", "측정 시작 후 시간", units="s")
+        panel.plot.setTitle(display.label, color=MUTED, size="13px")
+        panel.plot.plotItem.titleLabel.hide()
+        axis_style = {"color": MUTED, "font-size": "14px"}
+        panel.plot.setLabel("left", display.unit, **axis_style)
+        panel.plot.setLabel("bottom", "시간 (s)", **axis_style)
         panel.curve.setPen(pg.mkPen(display.color, width=2))
+        panel.current.setStyleSheet(f"color: {display.color};")
         panel.range_label.setText(f"Y축 자동 범위 · {display.label}: 데이터 대기")
 
     def _sync_channel_selectors(self, channel_names: tuple[str, ...]) -> None:
@@ -538,26 +678,33 @@ class MainWindow(QMainWindow):
         return f"{value:.{display.decimals}f}{suffix}"
 
     def _update_quick_settings_summary(self) -> None:
-        if not hasattr(self, "quick_settings_summary"):
-            return
-        self.quick_settings_summary.setText(
-            f"Pi {self.config.system.pi_host}:{self.config.ssh.port} · "
-            f"DAQ {self.config.daq.sample_rate:,} S/s · "
-            f"AI{self.config.thrust.channel}=로드셀, "
-            f"AI{self.config.pressure.channel}=두번째 센서 · "
-            f"압력 입력 {self.config.pressure_input.shunt_ohms:g} Ω "
-            f"({self.config.pressure_input.signal_voltage_min_v:.3f}–"
-            f"{self.config.pressure_input.signal_voltage_max_v:.3f} V) · "
-            f"압력 보정 scale={self.config.pressure.scale:.6g}, "
-            f"offset={self.config.pressure.offset:.6g} bar · "
-            f"표시/저장 LPF={'ON' if self.config.low_pass.enabled else 'OFF'} "
-            f"({self.config.low_pass.cutoff_hz:g} Hz) · "
-            "원본 raw/비필터 물리값도 함께 저장"
-        )
+        # Connection/calibration details belong in Setup, not the live view.
+        if hasattr(self, "low_pass_info"):
+            self.low_pass_info.setText(
+                f"{self.config.low_pass.cutoff_hz:g} Hz"
+                if self.config.low_pass.enabled else "사용 안 함"
+            )
 
     def _build_setup(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 12, 18, 18)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        grid = QGridLayout(content)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(18)
+        network_box = QGroupBox("연결")
+        network_form = QFormLayout(network_box)
+        network_form.setVerticalSpacing(16)
+        network_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        daq_box = QGroupBox("데이터 수집")
+        daq_form = QFormLayout(daq_box)
+        daq_form.setVerticalSpacing(16)
+        storage_box = QGroupBox("저장")
+        storage_form = QFormLayout(storage_box)
+        storage_form.setVerticalSpacing(16)
         self.pi_host = QLineEdit(self.config.system.pi_host)
         self.telemetry_port = self._spin(1, 65535, self.config.system.telemetry_port)
         self.ssh_port = self._spin(1, 65535, self.config.ssh.port)
@@ -569,13 +716,8 @@ class MainWindow(QMainWindow):
         self.nano_port = QLineEdit(self.config.nano.port)
         self.sample_rate_setup = self._spin(1, 47_619, self.config.daq.sample_rate)
         self.block_ms = self._spin(1, 1000, self.config.daq.block_ms)
-        low_pass_info = QLabel(
-            f"화면/로그 LPF: "
-            f"{'사용' if self.config.low_pass.enabled else '사용 안 함'} · "
-            f"차단주파수 {self.config.low_pass.cutoff_hz:g} Hz "
-            "(Pi와 동일 설정)"
-        )
-        low_pass_info.setWordWrap(True)
+        self.low_pass_info = QLabel()
+        self._update_quick_settings_summary()
         self.thrust_channel = self._spin(
             THRUST_AI_CHANNEL, THRUST_AI_CHANNEL, THRUST_AI_CHANNEL
         )
@@ -597,37 +739,44 @@ class MainWindow(QMainWindow):
                 self.remember_password,
             ):
                 widget.setEnabled(False)
-        display_filter = (
-            f"{self.config.low_pass.cutoff_hz:g} Hz LPF 처리된"
-            if self.config.low_pass.enabled
-            else "비필터"
-        )
-        display_scale = QLabel(
-            f"실시간 추력/압력은 Pi에서 {display_filter} 물리값을 표시합니다. "
-            "원본 raw와 비필터 물리값은 로그에 함께 저장합니다."
-        )
-        display_scale.setWordWrap(True)
-        fields = (
-            ("Pi IP Address (고정)", self.pi_host),
-            ("Telemetry Port (고정)", self.telemetry_port),
-            ("SSH Port (고정)", self.ssh_port),
-            ("SSH ID (고정)", self.ssh_id),
-            ("SSH Password (고정)", self.ssh_password),
+        for label, widget in (
+            ("Pi 주소", self.pi_host),
+            ("Telemetry 포트", self.telemetry_port),
+            ("SSH 포트", self.ssh_port),
+            ("사용자", self.ssh_id),
+            ("비밀번호", self.ssh_password),
             ("", self.remember_password),
-            ("Nano Port", self.nano_port),
-            ("Sample Rate", self.sample_rate_setup),
-            ("Block ms", self.block_ms),
-            ("Low-pass filter", low_pass_info),
-            ("AI0 (로드셀 · 고정)", self.thrust_channel),
-            ("AI1 (두번째 센서 · 고정)", self.pressure_channel),
-            ("Display Scale", display_scale),
-            ("Log Directory", self.log_directory),
-        )
-        for label, widget in fields:
-            form.addRow(label, widget)
+            ("Nano 포트", self.nano_port),
+        ):
+            network_form.addRow(label, widget)
+        self.sample_rate_setup.setSuffix(" S/s")
+        self.block_ms.setSuffix(" ms")
+        for label, widget in (
+            ("취득 속도", self.sample_rate_setup),
+            ("블록 시간", self.block_ms),
+            ("저역통과필터", self.low_pass_info),
+            ("로드셀 · AI0", self.thrust_channel),
+            ("압력 · AI1", self.pressure_channel),
+            ("션트 저항", QLabel(f"{self.config.pressure_input.shunt_ohms:g} Ω")),
+        ):
+            daq_form.addRow(label, widget)
+        storage_form.addRow("폴더", self.log_directory)
+        storage_form.addRow("로그", QLabel("HDF5 · 원본 + LPF"))
+        grid.addWidget(network_box, 0, 0, 2, 1)
+        grid.addWidget(daq_box, 0, 1)
+        grid.addWidget(storage_box, 1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(2, 1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
         save_button = QPushButton("설정 저장 및 재연결")
+        save_button.setProperty("role", "primary")
         save_button.clicked.connect(self._save_setup)
-        form.addRow(save_button)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(save_button)
+        layout.addLayout(buttons)
         return page
 
     def _build_system_test(self) -> QWidget:
@@ -636,6 +785,12 @@ class MainWindow(QMainWindow):
         self.system_test_button = QPushButton("전체 시스템 점검")
         self.system_test_table = QTableWidget(0, 3)
         self.system_test_table.setHorizontalHeaderLabels(("항목", "결과", "상세"))
+        self.system_test_table.verticalHeader().hide()
+        self.system_test_table.verticalHeader().setDefaultSectionSize(42)
+        self.system_test_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.system_test_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.system_test_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.system_test_button.setProperty("role", "primary")
         layout.addWidget(self.system_test_button)
         layout.addWidget(self.system_test_table)
         self.system_test_button.clicked.connect(self._run_system_test)
@@ -649,14 +804,15 @@ class MainWindow(QMainWindow):
         refresh = QPushButton("새로고침")
         open_folder = QPushButton("폴더 열기")
         export = QPushButton("CSV 내보내기")
-        fetch = QPushButton("Pi 최신 로그 가져오기")
+        fetch = QPushButton("Pi 로그 가져오기")
         for button in (refresh, open_folder, export, fetch):
             buttons.addWidget(button)
         self.advanced_log = QTextEdit()
         self.advanced_log.setReadOnly(True)
+        self.advanced_log.document().setMaximumBlockCount(500)
         layout.addWidget(self.log_list, 1)
         layout.addLayout(buttons)
-        layout.addWidget(QLabel("Advanced Log"))
+        layout.addWidget(QLabel("이벤트"))
         layout.addWidget(self.advanced_log, 1)
         refresh.clicked.connect(self._refresh_logs)
         open_folder.clicked.connect(self._open_log_folder)
@@ -669,6 +825,7 @@ class MainWindow(QMainWindow):
         self._signals.block.connect(self._receive_block)
         self._signals.health.connect(self._receive_health)
         self._signals.error.connect(self._show_error)
+        self._signals.operation_failed.connect(self._operation_failed)
         self._signals.session_started.connect(self._session_started)
         self._signals.session_stopped.connect(self._session_stopped)
         self._signals.calibration_sampled.connect(self._calibration_sampled)
@@ -676,6 +833,8 @@ class MainWindow(QMainWindow):
         self._signals.daq_reset_finished.connect(self._daq_reset_finished)
         self._signals.system_test_finished.connect(self._system_test_finished)
         self._signals.remote_log_downloaded.connect(self._remote_log_downloaded)
+        self._signals.log_message.connect(self._append_log)
+        self._signals.csv_exported.connect(self._csv_exported)
 
     def _start_runtime(self) -> None:
         if not self.direct_telemetry and not self.config.ssh.password:
@@ -690,6 +849,8 @@ class MainWindow(QMainWindow):
         self._runtime.start()
 
     def _start_session(self) -> None:
+        if self._session_operation or self._daq_reset_in_progress or self._daq_recovery_required:
+            return
         name = self.test_name.text().strip()
         if not name:
             QMessageBox.warning(self, "시험명 필요", "Test Name을 입력하십시오.")
@@ -698,13 +859,18 @@ class MainWindow(QMainWindow):
         # Clear immediately on the operator action, rather than waiting for
         # the asynchronous START_SESSION acknowledgement.
         self._clear_graphs()
-        self.start_button.setEnabled(False)
+        self._active_session_id = None
+        self._session_operation = "start"
+        self._update_daq_reset_button()
         self.state_label.setText("STATUS: STARTING")
         self._runtime.start_session(name)
 
     def _stop_session(self) -> None:
+        if self._session_operation or self._daq_reset_in_progress:
+            return
         assert self._runtime is not None
-        self.stop_button.setEnabled(False)
+        self._session_operation = "stop"
+        self._update_daq_reset_button()
         self.state_label.setText("STATUS: STOPPING")
         self._runtime.stop_session()
 
@@ -714,7 +880,7 @@ class MainWindow(QMainWindow):
                 self, "연결 대기", "Pi telemetry 연결이 준비된 뒤 보정하십시오."
             )
             return
-        if self.stop_button.isEnabled():
+        if self._session_operation or self._daq_reset_in_progress or self._agent_state in ("RECORDING", "TRIGGERED"):
             QMessageBox.warning(
                 self, "측정 중", "측정을 종료한 뒤에만 실행 전 캘리브레이션을 할 수 있습니다."
             )
@@ -736,7 +902,7 @@ class MainWindow(QMainWindow):
                 self, "연결 대기", "Pi telemetry 연결이 준비된 뒤 보정하십시오."
             )
             return
-        if self.stop_button.isEnabled():
+        if self._session_operation or self._daq_reset_in_progress or self._agent_state in ("RECORDING", "TRIGGERED"):
             QMessageBox.warning(
                 self, "측정 중", "측정을 종료한 뒤에만 실행 전 캘리브레이션을 할 수 있습니다."
             )
@@ -756,12 +922,14 @@ class MainWindow(QMainWindow):
         self._calibration_dialog = None
 
     def _reset_daq(self) -> None:
+        if self._daq_reset_in_progress or self._session_operation:
+            return
         if self._runtime is None:
             QMessageBox.warning(
                 self, "연결 대기", "Dashboard 백엔드가 준비된 뒤 DAQ를 초기화하십시오."
             )
             return
-        if self.stop_button.isEnabled():
+        if self._agent_state in ("RECORDING", "TRIGGERED") and not self._daq_recovery_required:
             QMessageBox.warning(
                 self, "측정 중", "측정을 종료한 뒤에만 DAQ 초기화를 실행할 수 있습니다."
             )
@@ -775,15 +943,19 @@ class MainWindow(QMainWindow):
 
     def _daq_reset_finished(self, result: dict[str, object]) -> None:
         self._daq_reset_in_progress = False
+        self._daq_recovery_required = not bool(result.get("daq_ready"))
         details = str(result.get("details", "")).strip()
         if bool(result.get("daq_ready")):
-            self._append_log("DAQ 초기화 완료: /dev/daq0 준비됨. Pi 재연결 중입니다.")
+            self._agent_state = "READY"
+            self.state_label.setText("STATUS: READY")
+            self._append_log("DAQ 초기화 완료: 실제 입력 취득·종료 및 Pi 연결 검증 통과.")
         else:
+            self.state_label.setText("STATUS: DAQ RECOVERY REQUIRED")
             self._append_log(
-                "DAQ 초기화는 끝났지만 /dev/daq0이 없습니다. USB 전원·케이블을 확인하십시오."
+                "DAQ 초기화 실패: 입력 취득 검증을 통과하지 못했습니다. USB 전원·케이블을 확인하십시오."
             )
         if details:
-            self.pipeline_message.setText(f"DAQ 초기화: {details}")
+            self.pipeline_message.setToolTip(details)
         self._update_daq_reset_button()
 
     def _capture_calibration_sample(self, row: int, duration_ms: int) -> None:
@@ -791,9 +963,15 @@ class MainWindow(QMainWindow):
             if self._calibration_dialog is not None:
                 self._calibration_dialog.operation_failed("Pi telemetry 연결이 없습니다")
             return
+        if self._session_operation or self._daq_reset_in_progress:
+            return
+        self._session_operation = "calibration"
+        self._update_daq_reset_button()
         self._runtime.capture_calibration_sample(row=row, duration_ms=duration_ms)
 
     def _calibration_sampled(self, result: dict[str, Any]) -> None:
+        self._session_operation = None
+        self._update_daq_reset_button()
         if self._calibration_dialog is not None:
             self._calibration_dialog.record_capture(result)
 
@@ -854,13 +1032,18 @@ class MainWindow(QMainWindow):
             self._calibration_dialog.calibration_saved(result)
 
     def _session_started(self, result: dict[str, Any]) -> None:
+        self._session_operation = None
+        self._agent_state = "RECORDING"
+        self._active_session_id = result.get("session_id")
         self._clear_graphs()
-        self.state_label.setText("STATUS: RECORDING / ARMED")
+        self.state_label.setText("STATUS: RECORDING")
         self.stop_button.setEnabled(True)
         self._update_daq_reset_button()
         self._append_log(f"Session started: {result.get('log_file', '')}")
 
     def _session_stopped(self, result: dict[str, Any]) -> None:
+        self._session_operation = None
+        self._agent_state = "COMPLETE"
         self.state_label.setText("STATUS: COMPLETE")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -869,6 +1052,10 @@ class MainWindow(QMainWindow):
         self._refresh_logs()
 
     def _receive_block(self, block: TelemetryBlock) -> None:
+        if self._session_operation == "start" or self._daq_reset_in_progress:
+            return
+        if block.session_id is not None and block.session_id != self._active_session_id:
+            return
         if (
             block.sample_count <= 0
             or block.sample_rate <= 0
@@ -925,8 +1112,7 @@ class MainWindow(QMainWindow):
         self._last_sample_rate = block.sample_rate
         self.sample_rate.setText(f"{block.sample_rate:,} S/s")
         self.data_window.setText(
-            f"최근 데이터: {len(self._sample_indices):,} samples / "
-            f"{len(self._sample_indices) / block.sample_rate:.1f} s"
+            f"{len(self._sample_indices):,} samples"
         )
         if self._trigger_sample is not None:
             elapsed = int(self._sample_indices[-1]) - self._trigger_sample
@@ -950,7 +1136,16 @@ class MainWindow(QMainWindow):
             self._trigger_sample = trigger_sample
             self._last_plot_update = 0.0
         state = str(status.get("state", "DISCONNECTED"))
-        self.state_label.setText(f"STATUS: {state}")
+        self._agent_state = state
+        if status.get("recovery_required"):
+            self._daq_recovery_required = True
+        if not self._session_operation and not self._daq_reset_in_progress:
+            self.state_label.setText(
+                "STATUS: DAQ RECOVERY REQUIRED" if self._daq_recovery_required
+                else f"STATUS: {state}"
+            )
+        if not self._session_operation and not self._daq_reset_in_progress:
+            self._active_session_id = status.get("session_id")
         health = status.get("health", {})
         daq_state = str(health.get("daq", "UNKNOWN"))
         self._health_status("DAQ", daq_state)
@@ -961,29 +1156,28 @@ class MainWindow(QMainWindow):
             reason = str(probe.get("reason", "")).strip()
             if reason and daq_state.upper() not in ("RUNNING", "AVAILABLE"):
                 self.pipeline_message.setText(f"DAQ 상태: {reason}")
-        if state in ("RECORDING", "TRIGGERED"):
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(self._runtime is not None)
-        elif state in ("READY", "COMPLETE"):
-            self.start_button.setEnabled(self._runtime is not None)
-            self.stop_button.setEnabled(False)
         self._update_daq_reset_button()
         self._update_pipeline_summary()
 
     def _connection_changed(self, component: str, status: str) -> None:
         self._connection_states[component] = status
-        name = "Pi" if component == "Trigger" else component
-        if name in self._status_labels:
-            self._health_status(name, status)
+        if component in self._status_labels:
+            self._health_status(component, status)
         if component == "Pi" and status == "CONNECTED":
-            self.start_button.setEnabled(True)
             self._set_status("LAN", "Connected", "GREEN")
-        elif component == "Pi":
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(False)
         self._update_daq_reset_button()
         if component == "Trigger":
-            self.state_label.setText(f"STATUS: TRIGGERED ({status})")
+            # Transport/arming notices are not proof that Pi stored an event.
+            sample = status.removeprefix("SAMPLE ")
+            if (
+                status.startswith("SAMPLE ") and sample.isdecimal()
+                and not self._session_operation and not self._daq_reset_in_progress
+                and self._agent_state in ("RECORDING", "TRIGGERED")
+            ):
+                self._trigger_sample = int(sample)
+                self._agent_state = "TRIGGERED"
+                self._last_plot_update = 0.0
+                self.state_label.setText(f"STATUS: TRIGGERED ({status})")
         self._append_log(f"{component}: {status}")
         self._update_pipeline_summary()
 
@@ -1006,15 +1200,22 @@ class MainWindow(QMainWindow):
     def _update_daq_reset_button(self) -> None:
         if not hasattr(self, "daq_reset_button"):
             return
-        idle = not self.stop_button.isEnabled()
+        busy = self._session_operation is not None or self._daq_reset_in_progress
+        recording = self._agent_state in ("RECORDING", "TRIGGERED")
+        connected = self._runtime is not None and self._connection_states.get("Pi") == "CONNECTED"
+        self.start_button.setEnabled(
+            connected and not busy and not recording and not self._daq_recovery_required
+            and self._agent_state in ("READY", "COMPLETE")
+        )
+        self.stop_button.setEnabled(connected and not busy and recording and not self._daq_recovery_required)
         self.daq_reset_button.setEnabled(
             self._runtime is not None
-            and idle
-            and not self._daq_reset_in_progress
+            and not busy
+            and (not recording or self._daq_recovery_required)
         )
 
     def _health_status(self, component: str, value: str) -> None:
-        upper = value.upper()
+        upper = value.upper().split(" / ", 1)[0]
         if upper in (
             "CONNECTED",
             "RUNNING",
@@ -1023,12 +1224,14 @@ class MainWindow(QMainWindow):
             "AVAILABLE",
             "OK",
             "COMPLETE",
+            "ARMED",
+            "TRIGGERED",
         ):
             color = "GREEN"
         elif (
             "RECONNECT" in upper
             or "TIMEOUT" in upper
-            or upper in ("STARTING", "LOW", "BYPASSED")
+            or upper in ("STARTING", "LOW", "BYPASSED", "ARMING", "IGNITION_HIGH")
         ):
             color = "YELLOW"
         elif upper in ("UNKNOWN", "INACTIVE"):
@@ -1041,9 +1244,28 @@ class MainWindow(QMainWindow):
         label = self._status_labels.get(component)
         if label is None:
             return
-        label.setText(f"● {component}: {text}")
+        names = {"Pi": "Pi", "Logger": "기록", "Disk": "저장공간"}
+        states = {
+            "CONNECTED": "연결됨", "DISCONNECTED": "연결 끊김",
+            "CONNECTING": "연결 중", "RECONNECTING": "재연결 중",
+            "RUNNING": "취득 중", "RECORDING": "기록 중", "READY": "준비됨",
+            "AVAILABLE": "준비됨", "OK": "정상", "COMPLETE": "완료",
+            "UNKNOWN": "대기", "INACTIVE": "대기", "NOT_FOUND": "미연결",
+            "NOT FOUND": "미연결", "TIMEOUT": "시간 초과", "FAILED": "오류",
+            "INITIALIZING": "초기화 중", "STARTING": "시작 중", "LOW": "부족",
+            "BYPASSED": "로컬", "MISSING": "미연결", "ERROR": "오류",
+            "ARMED": "점화 감지 대기", "ARMING": "점화 감지 준비 중",
+            "IGNITION_HIGH": "점화 입력 HIGH",
+        }
+        state, separator, level = text.upper().partition(" / ")
+        display = states.get(state, state.replace("_", " "))
+        if separator:
+            display += f" / {level}"
+        label.setText(f"{names.get(component, component)}  {display}")
+        label.setToolTip(f"{component}: {text}")
         label.setStyleSheet(
-            f"color: {STATUS_COLORS[color]}; font-weight: bold; padding: 4px;"
+            f"color: {STATUS_COLORS[color]}; background: #2e3035; "
+            f"border-left: 2px solid {STATUS_COLORS[color]}; padding: 5px 8px;"
         )
 
     def _save_setup(self) -> None:
@@ -1156,12 +1378,10 @@ class MainWindow(QMainWindow):
         )
         if not destination:
             return
-        try:
-            export_csv(session.path, destination)
-        except LogError as exc:
-            QMessageBox.critical(self, "CSV 오류", str(exc))
+        if self._runtime is None:
+            self._operation_failed("save", "Dashboard 백엔드가 아직 준비되지 않았습니다.")
             return
-        QMessageBox.information(self, "CSV 완료", destination)
+        self._runtime.export_log(session.path, destination)
 
     def _fetch_pi_log(self) -> None:
         if self._runtime is None:
@@ -1169,36 +1389,71 @@ class MainWindow(QMainWindow):
                 self, "연결 대기", "Dashboard 백엔드가 아직 연결되지 않았습니다."
             )
             return
-        self._runtime.fetch_latest_remote_log()
+        row = self.log_list.currentRow()
+        selected = self._sessions[row].path.name if 0 <= row < len(self._sessions) else None
+        self._runtime.fetch_latest_remote_log(selected)
 
     def _remote_log_downloaded(self, path: str) -> None:
         self._append_log(f"Pi log downloaded: {path}")
         self._refresh_logs()
 
+    def _csv_exported(self, path: str) -> None:
+        self._append_log(f"CSV saved: {path}")
+
     def _show_error(self, message: str) -> None:
+        # Background reconnects are status events, not modal operator actions.
+        # In particular they must not end an in-flight DAQ recovery.
         self._append_log(f"ERROR: {message}")
-        if self._daq_reset_in_progress:
-            self._daq_reset_in_progress = False
-            self._update_daq_reset_button()
-        if self._calibration_dialog is not None:
-            self._calibration_dialog.operation_failed(message)
-        if "DAQ 초기화" in message:
+        if "DAQ 초기화" in message and not self._daq_reset_in_progress:
             # A bounded Pi-side hardware operation has detected a wedged USB
             # ioctl. Keep Start disabled so a late command cannot surprise the
             # operator; the reset button remains available even if telemetry
             # itself is no longer responsive.
             self.state_label.setText("STATUS: DAQ RECOVERY REQUIRED")
-            self.start_button.setEnabled(False)
+            self._daq_recovery_required = True
             self._update_daq_reset_button()
-        QMessageBox.critical(self, "TUSI TMS 오류", message)
-        if "session" in message.lower() and "DAQ 초기화" not in message:
-            self.start_button.setEnabled(True)
+
+    def _operation_failed(self, operation: str, message: str) -> None:
+        if operation in ("start", "stop", "calibration"):
+            self._session_operation = None
+        if operation == "reset":
+            self._daq_reset_in_progress = False
+            self._daq_recovery_required = True
+        if operation == "calibration" and self._calibration_dialog is not None:
+            self._calibration_dialog.operation_failed(message)
+        if operation in ("start", "stop", "calibration") and "timed out" in message.lower():
+            self._daq_recovery_required = True
+        self._show_error(message)
+        self._update_daq_reset_button()
+        if self._daq_recovery_required:
+            self.state_label.setText("STATUS: DAQ RECOVERY REQUIRED")
+        if operation == "calibration" and self._calibration_dialog is not None:
+            # The calibration dialog is already modal and shows this error
+            # inline. A second window parented to the main window would be
+            # blocked by that dialog and appear impossible to dismiss.
+            return
+        # A single modeless dialog: no nested exec() loop, stacked alarms or
+        # disabled X button. Closing it does not cancel the background command.
+        if self._error_dialog is None:
+            self._error_dialog = QMessageBox(self)
+            self._error_dialog.setWindowTitle("TMS 오류")
+            self._error_dialog.setIcon(QMessageBox.Icon.Critical)
+            self._error_dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+            self._error_dialog.setModal(False)
+        self._error_dialog.setText(message)
+        self._error_dialog.show()
 
     def _append_log(self, message: str) -> None:
         if hasattr(self, "advanced_log"):
             self.advanced_log.append(message)
+        if hasattr(self, "event_console"):
+            self.event_console.append(message)
         if hasattr(self, "pipeline_message"):
-            self.pipeline_message.setText(f"최근 이벤트: {message}")
+            if message.startswith(("Nano:", "LAN:", "SSH:", "Pi:", "Trigger:")):
+                return
+            # The full text remains available in the console and tooltip.
+            self.pipeline_message.setText(message.splitlines()[0][:110])
+            self.pipeline_message.setToolTip(message)
 
     def _clear_graphs(self) -> None:
         self._sample_indices = np.empty(0, dtype=np.int64)
@@ -1222,7 +1477,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "t_plus"):
             self.t_plus.setText("Pre-trigger")
         if hasattr(self, "data_window"):
-            self.data_window.setText("최근 데이터: --")
+            self.data_window.setText("-- samples")
 
     @staticmethod
     def _spin(minimum: int, maximum: int, value: int) -> QSpinBox:

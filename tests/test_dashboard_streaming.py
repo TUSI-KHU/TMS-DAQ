@@ -1,9 +1,14 @@
+import asyncio
+from dataclasses import replace
+
 import numpy as np
 
 from common.protocol import TelemetryBlock
+from common.config import ChannelConfig, DaqConfig, LoggingConfig, TmsConfig
 from laptop.backend import DashboardBackend
-from pi.daq import DaqBlock
+from pi.daq import DaqBlock, SimulatedDaqSource
 from pi.telemetry import TelemetryServer
+from pi.tms_agent import TmsAgent
 
 
 def test_dashboard_visual_batch_preserves_contiguous_samples() -> None:
@@ -25,6 +30,9 @@ def test_dashboard_visual_batch_preserves_contiguous_samples() -> None:
     )
 
     assert DashboardBackend._blocks_are_contiguous(first, second)
+    assert not DashboardBackend._blocks_are_contiguous(
+        replace(first, session_id="old"), replace(second, session_id="new")
+    )
     merged = DashboardBackend._merge_blocks([first, second])
 
     assert merged.sequence == 12
@@ -69,3 +77,70 @@ def test_pi_telemetry_batch_preserves_raw_samples_and_detects_gap() -> None:
         merged.raw_samples,
         ((10, 20), (11, 21), (12, 22)),
     )
+
+
+def test_recovery_pauses_reconnect_without_rotating_ssh(tmp_path):
+    async def scenario():
+        config = TmsConfig(
+            daq=DaqConfig(sample_rate=1000, block_ms=10),
+            thrust=ChannelConfig(0, 1, 0), pressure=ChannelConfig(1, 1, 0),
+            logging=LoggingConfig(directory=tmp_path),
+        )
+        server = TelemetryServer(
+            TmsAgent(config, SimulatedDaqSource(config.daq, (0, 1))), config, port=0,
+        )
+        await server.start()
+        port = server.port
+        server.requested_port = port
+        errors = []
+        connections = []
+
+        class SSH:
+            connected = True
+            disconnects = 0
+
+            async def connect(self):
+                return port
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+            async def recover_usb4704(self):
+                await server.close()
+                await asyncio.sleep(0.2)
+                assert not errors
+                assert self.disconnects == 0
+                await server.start()
+                return {"daq_ready": True}
+
+        class Nano:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        ssh = SSH()
+        backend = DashboardBackend(
+            config, ssh_manager=ssh, nano_manager=Nano(),
+            error_callback=errors.append,
+            connection_callback=lambda *event: connections.append(event),
+        )
+        task = asyncio.create_task(backend.run())
+        try:
+            async def connected():
+                while not backend.telemetry.connected:
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(connected(), 2)
+            result = await backend.reset_daq()
+            assert result["daq_ready"]
+            assert backend.telemetry.connected
+            assert ssh.disconnects == 0
+            assert errors == []
+            assert ("Pi", "RECONNECTING") not in connections
+        finally:
+            await backend.stop()
+            await asyncio.wait_for(task, 2)
+            await server.close()
+
+    asyncio.run(scenario())

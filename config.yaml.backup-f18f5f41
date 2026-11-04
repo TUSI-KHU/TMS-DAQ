@@ -1,0 +1,39 @@
+system:
+  pi_host: 10.47.0.2
+  telemetry_port: 29100
+ssh:
+  port: 22
+  username: tms
+  password: tms
+  remember_password: true
+  connect_timeout_sec: 10.0
+  keepalive_interval_sec: 5.0
+nano:
+  port: auto
+  baudrate: 115200
+  heartbeat_timeout_sec: 2.0
+daq:
+  sample_rate: 5000
+  block_ms: 10
+  device: /dev/daq0
+channels:
+  thrust:
+    channel: 0
+    scale: 0.10196999887235018
+    offset: -1045.1759619809206
+  pressure:
+    channel: 1
+    scale: 34.65346534677413
+    offset: -283799.1159849881
+pressure_input:
+  shunt_ohms: 100.0
+  loop_min_mA: 4.0
+  loop_max_mA: 20.0
+low_pass:
+  enabled: true
+  cutoff_hz: 50.0
+logging:
+  directory: logs
+  ring_buffer_sec: 5.0
+  flush_interval_sec: 1.0
+  pi_directory: /var/lib/tusi-tms/logs

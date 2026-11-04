@@ -27,6 +27,9 @@ tusi-tms = "laptop.main:main"
 [tool.setuptools.packages.find]
 include = ["common*", "pi*", "laptop*"]
 
+[tool.setuptools.package-data]
+"laptop.gui" = ["assets/*.svg"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

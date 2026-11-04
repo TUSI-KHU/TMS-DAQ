@@ -152,7 +152,7 @@ class SshTunnelManager:
         )
         if result.exit_status == 0:
             return {"daq_ready": True, "details": details or "DAQ_READY"}
-        if result.exit_status == 3:
+        if result.exit_status in (3, 6):
             return {
                 "daq_ready": False,
                 "details": details or "/dev/daq0 is still missing after recovery",

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import queue
 import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass, replace
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -38,12 +40,35 @@ class SessionError(RuntimeError):
     """Raised when a measurement session cannot be started or completed."""
 
 
+class TriggerPendingError(SessionError):
+    """The same trigger may be retried while its sample or disk receipt is pending."""
+
+
+@dataclass
+class EventReceipt:
+    done: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
+
+
 @dataclass(frozen=True)
 class EventRequest:
     event_type: str
     sample_index: int
     receive_time: str
     details: str = ""
+    receipt: EventReceipt | None = None
+
+
+@dataclass
+class NanoStateRequest:
+    identity: tuple[object, ...]
+    event: EventRequest
+    received_monotonic: float
+    gpio_state: bool | None
+    valid_for_ms: int
+    nano_uptime_ms: int | None
+    ignition: EventRequest | None = None
+    ignition_queued: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +89,8 @@ LogItem: TypeAlias = DaqBlock | EventRequest | HealthRequest | _StopLogger
 STORAGE_WARNING_BYTES = 1024**3
 STORAGE_WARNING_FRACTION = 0.10
 HEALTH_REFRESH_SECONDS = 5.0
+TRIGGER_WRITE_TIMEOUT_SECONDS = 2.0
+NANO_STATE_RECEIPT_CACHE_SIZE = 4096
 
 
 class TmsAgent:
@@ -107,6 +134,17 @@ class TmsAgent:
         self._acquisition_thread: threading.Thread | None = None
         self._logger_thread: threading.Thread | None = None
         self._trigger_sample: int | None = None
+        self._trigger_identity: tuple[object, ...] | None = None
+        self._pending_trigger: EventRequest | None = None
+        self._trigger_lock = threading.Lock()
+        self._pending_nano_state: NanoStateRequest | None = None
+        self._nano_state_receipts: OrderedDict[
+            str, tuple[tuple[object, ...], dict[str, int | None]]
+        ] = OrderedDict()
+        self._nano_gpio_state: bool | None = None
+        self._nano_state_valid_until = 0.0
+        self._nano_uptime_ms: int | None = None
+        self._latest_queued_sample_index: int | None = None
         self._session_id: str | None = None
         self._dropped_blocks = 0
         self._failures: list[BaseException] = []
@@ -250,10 +288,17 @@ class TmsAgent:
             self._daq_probe["reason"] = str(exc)
             raise DaqError(f"calibration capture failed: {exc}") from exc
         finally:
-            if started:
-                self.daq.stop()
-                self.daq.close()
-            self.state = original_state
+            try:
+                if started:
+                    self.daq.stop()
+                    self.daq.close()
+            except (DaqError, OSError) as exc:
+                self.health["daq"] = "FAILED"
+                self._daq_probe["available"] = False
+                self._daq_probe["reason"] = str(exc)
+                raise DaqError(f"calibration cleanup failed; run DAQ 초기화: {exc}") from exc
+            finally:
+                self.state = original_state
 
         summaries: dict[str, dict[str, float | int]] = {}
         for name, channel in (
@@ -350,6 +395,14 @@ class TmsAgent:
         self._stop_event.clear()
         self._failures.clear()
         self._trigger_sample = None
+        self._trigger_identity = None
+        self._pending_trigger = None
+        self._pending_nano_state = None
+        self._nano_state_receipts.clear()
+        self._nano_gpio_state = None
+        self._nano_state_valid_until = 0.0
+        self._nano_uptime_ms = None
+        self._latest_queued_sample_index = None
         self._dropped_blocks = 0
         self._telemetry_dropped_blocks = 0
         self._last_block_monotonic = None
@@ -412,43 +465,278 @@ class TmsAgent:
         self._queue_health("storage", self.health["storage"], "storage checked")
         return path
 
-    def record_trigger(self, *, receive_time: str | None = None) -> int:
-        if self.state == AgentState.TRIGGERED:
-            raise SessionError("ignition trigger was already recorded for this session")
-        if self.state != AgentState.RECORDING:
-            raise SessionError(f"cannot record trigger while state is {self.state}")
+    def record_trigger(
+        self,
+        *,
+        receive_time: str | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
+        nano_sequence: int | None = None,
+        nano_uptime_ms: int | None = None,
+    ) -> int:
+        for name, value, limit in (
+            ("receive_time", receive_time, 40),
+            ("session_id", session_id, 64),
+            ("source", source, 32),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value or len(value.encode("utf-8")) > limit
+            ):
+                raise SessionError(f"TRIGGER {name} must be a nonempty string of at most {limit} bytes")
+        for name, value in (("nano_sequence", nano_sequence), ("nano_uptime_ms", nano_uptime_ms)):
+            if value is not None and (type(value) is not int or not 0 <= value <= 0xFFFFFFFF):
+                raise SessionError(f"TRIGGER {name} must be an unsigned 32-bit integer")
+        if source == "nano" and any(
+            value is None for value in (session_id, receive_time, nano_sequence, nano_uptime_ms)
+        ):
+            raise SessionError("Nano TRIGGER requires session_id, receive_time, nano_sequence and nano_uptime_ms")
+        if source != "nano" and (nano_sequence is not None or nano_uptime_ms is not None):
+            raise SessionError("Nano identity fields require source=nano")
 
-        sample_index = self.latest_sample_index
-        if sample_index is None:
-            raise SessionError("cannot record trigger before the first DAQ block")
-
-        event = EventRequest(
-            event_type="ignition",
-            sample_index=sample_index,
-            receive_time=receive_time or utc_now(),
+        # A retry must identify the same edge and acquisition session; an
+        # unqualified legacy trigger remains a one-shot command.
+        identity = (
+            (session_id, source, nano_sequence, nano_uptime_ms, receive_time)
+            if source == "nano" else None
         )
-        try:
-            self._logger_queue.put(event, timeout=1.0)
-        except queue.Full as exc:
-            self.health["logger"] = "FAILED"
-            raise SessionError(
-                "logger queue is full; trigger was not recorded"
-            ) from exc
+        with self._trigger_lock:
+            active_session_id = self._session_id
+            if session_id is not None and session_id != self._session_id:
+                raise SessionError("TRIGGER session_id does not match the active session")
+            if self.state == AgentState.TRIGGERED:
+                if identity is not None and identity == self._trigger_identity:
+                    assert self._trigger_sample is not None
+                    return self._trigger_sample
+                raise SessionError("ignition trigger was already recorded for this session")
+            if self.state != AgentState.RECORDING:
+                raise SessionError(f"cannot record trigger while state is {self.state}")
+            if (
+                self._stop_event.is_set()
+                or self.health["logger"] != "RECORDING"
+                or self._logger_thread is None
+                or not self._logger_thread.is_alive()
+            ):
+                raise SessionError("logger is not recording; trigger was not recorded")
 
-        self._trigger_sample = sample_index
-        self.state = AgentState.TRIGGERED
-        return sample_index
+            event = self._pending_trigger
+            if self._pending_nano_state is not None:
+                raise TriggerPendingError("Nano state is awaiting logger confirmation")
+            if event is not None:
+                if identity is None or identity != self._trigger_identity:
+                    raise SessionError("a different ignition trigger is awaiting logger confirmation")
+            else:
+                # Reference only a sample block already handed to the writer.
+                # The acquisition ring can otherwise get ahead of its queue,
+                # leaving an acknowledged trigger pointing at a dropped row.
+                sample_index = self._latest_queued_sample_index
+                if sample_index is None:
+                    raise TriggerPendingError("cannot record trigger before the first DAQ block")
+                details = {
+                    "source": source or "unspecified",
+                    "session_id": self._session_id,
+                    "timing_basis": "pi_latest_sample_on_receipt",
+                }
+                if source == "nano":
+                    details.update(nano_sequence=nano_sequence, nano_uptime_ms=nano_uptime_ms)
+                encoded_details = json.dumps(details, separators=(",", ":"))
+                if len(encoded_details.encode("utf-8")) > 256:
+                    raise SessionError("TRIGGER metadata exceeds the event storage capacity")
+                event = EventRequest(
+                    event_type="ignition",
+                    sample_index=sample_index,
+                    receive_time=receive_time or utc_now(),
+                    details=encoded_details,
+                    receipt=EventReceipt(),
+                )
+                try:
+                    self._logger_queue.put(event, timeout=1.0)
+                except queue.Full as exc:
+                    raise SessionError("logger queue is full; trigger was not recorded") from exc
+                self._pending_trigger = event
+                self._trigger_identity = identity
 
-    def stop_session(self, *, timeout: float = 5.0) -> Path:
+            assert event.receipt is not None
+            if not event.receipt.done.wait(timeout=TRIGGER_WRITE_TIMEOUT_SECONDS):
+                raise TriggerPendingError("ignition trigger is awaiting logger confirmation; retry the same event")
+            if event.receipt.error is not None:
+                raise SessionError(f"ignition trigger was not recorded: {event.receipt.error}") from event.receipt.error
+            # A disconnected client's coroutine can be cancelled while this
+            # worker is still awaiting disk. Never let that late completion
+            # change a stopped session or a subsequent acquisition's state.
+            if (
+                self._session_id != active_session_id
+                or self._pending_trigger is not event
+                or self.state != AgentState.RECORDING
+                or self._stop_event.is_set()
+            ):
+                raise SessionError("session ended before ignition trigger confirmation")
+            self._trigger_sample = event.sample_index
+            self.state = AgentState.TRIGGERED
+            return event.sample_index
+
+    def record_nano_state(
+        self,
+        *,
+        session_id: str,
+        gpio_state: bool | None,
+        nano_sequence: int | None,
+        nano_uptime_ms: int | None,
+        receive_time: str,
+        event_id: str,
+        valid_for_ms: int = 2000,
+    ) -> dict[str, int | None]:
+        """Persist every level, deriving ignition only from a fresh LOW→HIGH.
+
+        An initial HIGH is a level, not evidence of when ignition began. An
+        unknown state, expired heartbeat, or Nano uptime reset breaks edge
+        continuity. ACKs and repeat IDs refer to flushed writer receipts.
+        """
+        for name, value, limit in (
+            ("session_id", session_id, 64),
+            ("receive_time", receive_time, 40),
+            ("event_id", event_id, 64),
+        ):
+            if not isinstance(value, str) or not value or len(value.encode("utf-8")) > limit:
+                raise SessionError(f"NANO_STATE {name} must be a nonempty string of at most {limit} bytes")
+        if gpio_state is not None and type(gpio_state) is not bool:
+            raise SessionError("NANO_STATE gpio_state must be a boolean or null")
+        for name, value in (("nano_sequence", nano_sequence), ("nano_uptime_ms", nano_uptime_ms)):
+            if value is not None and (type(value) is not int or not 0 <= value <= 0xFFFFFFFF):
+                raise SessionError(f"NANO_STATE {name} must be an unsigned 32-bit integer")
+        if gpio_state is not None and (nano_sequence is None or nano_uptime_ms is None):
+            raise SessionError("known NANO_STATE requires nano_sequence and nano_uptime_ms")
+        if type(valid_for_ms) is not int or not 0 <= valid_for_ms <= 2000:
+            raise SessionError("NANO_STATE valid_for_ms must be between 0 and 2000")
+
+        identity = (session_id, gpio_state, nano_sequence, nano_uptime_ms, receive_time, valid_for_ms)
+        with self._trigger_lock:
+            if session_id != self._session_id:
+                raise SessionError("NANO_STATE session_id does not match the active session")
+            if self.state not in (AgentState.RECORDING, AgentState.TRIGGERED):
+                raise SessionError(f"cannot record Nano state while state is {self.state}")
+            if (
+                self._stop_event.is_set()
+                or self.health["logger"] != "RECORDING"
+                or self._logger_thread is None
+                or not self._logger_thread.is_alive()
+            ):
+                raise SessionError("logger is not recording; Nano state was not recorded")
+            cached = self._nano_state_receipts.get(event_id)
+            if cached is not None:
+                if cached[0] != identity:
+                    raise SessionError("NANO_STATE event_id was reused with different contents")
+                return dict(cached[1])
+            pending = self._pending_nano_state
+            if pending is not None:
+                if pending.identity != (event_id, *identity):
+                    if pending.identity[0] == event_id:
+                        raise SessionError("NANO_STATE event_id was reused with different contents")
+                    raise TriggerPendingError("a different Nano state is awaiting logger confirmation; retry it first")
+            else:
+                if self._pending_trigger is not None and self._trigger_sample is None:
+                    raise TriggerPendingError("ignition trigger is awaiting logger confirmation")
+                sample_index = self._latest_queued_sample_index
+                if sample_index is None:
+                    raise TriggerPendingError("cannot record Nano state before the first DAQ block")
+                now = time.monotonic()
+                details = {
+                    "source": "nano",
+                    "gpio_state": -1 if gpio_state is None else int(gpio_state),
+                    "nano_sequence": nano_sequence,
+                    "nano_uptime_ms": nano_uptime_ms,
+                    "timing_basis": "pi_latest_sample_on_receipt",
+                    "valid_for_ms": valid_for_ms,
+                }
+                # The event ID is an in-memory transport receipt key; keeping
+                # it out of the fixed 256-byte field leaves room for full u32s.
+                event = EventRequest(
+                    "nano_state", sample_index, receive_time,
+                    json.dumps(details, separators=(",", ":")), EventReceipt(),
+                )
+                ignition = None
+                uptime_continuous = (
+                    self._nano_uptime_ms is not None and nano_uptime_ms is not None
+                    and (nano_uptime_ms - self._nano_uptime_ms) % (1 << 32) < (1 << 31)
+                )
+                if (
+                    self._trigger_sample is None and self._nano_gpio_state is False
+                    and gpio_state is True and now < self._nano_state_valid_until
+                    and uptime_continuous and valid_for_ms > 0
+                ):
+                    ignition_details = {
+                        "source": "nano", "session_id": session_id,
+                        "nano_sequence": nano_sequence, "nano_uptime_ms": nano_uptime_ms,
+                        "timing_basis": "pi_latest_sample_on_receipt",
+                    }
+                    ignition = EventRequest(
+                        "ignition", sample_index, receive_time,
+                        json.dumps(ignition_details, separators=(",", ":")), EventReceipt(),
+                    )
+                pending = NanoStateRequest(
+                    (event_id, *identity), event, now, gpio_state, valid_for_ms,
+                    nano_uptime_ms, ignition,
+                )
+                try:
+                    self._logger_queue.put(event, timeout=1.0)
+                except queue.Full as exc:
+                    raise SessionError("logger queue is full; Nano state was not recorded") from exc
+                self._pending_nano_state = pending
+
+            self._wait_nano_event(pending.event)
+            if (
+                self._session_id != session_id or self._pending_nano_state is not pending
+                or self.state not in (AgentState.RECORDING, AgentState.TRIGGERED)
+                or self._stop_event.is_set()
+            ):
+                raise SessionError("session ended before Nano state confirmation")
+            if pending.ignition is not None:
+                if not pending.ignition_queued:
+                    try:
+                        self._logger_queue.put(pending.ignition, timeout=1.0)
+                    except queue.Full as exc:
+                        raise TriggerPendingError("Nano ignition is awaiting logger space; retry the same state") from exc
+                    pending.ignition_queued = True
+                self._wait_nano_event(pending.ignition)
+            if (
+                self._session_id != session_id or self._pending_nano_state is not pending
+                or self.state not in (AgentState.RECORDING, AgentState.TRIGGERED)
+                or self._stop_event.is_set()
+            ):
+                raise SessionError("session ended before Nano state confirmation")
+            if pending.ignition is not None:
+                self._trigger_sample = pending.ignition.sample_index
+                self._trigger_identity = (session_id, "nano", nano_sequence, nano_uptime_ms, receive_time)
+                self.state = AgentState.TRIGGERED
+            self._nano_gpio_state = pending.gpio_state
+            self._nano_uptime_ms = pending.nano_uptime_ms
+            self._nano_state_valid_until = pending.received_monotonic + pending.valid_for_ms / 1000.0
+            result = {"sample_index": pending.event.sample_index, "trigger_sample": self._trigger_sample}
+            self._nano_state_receipts[event_id] = (identity, result)
+            while len(self._nano_state_receipts) > NANO_STATE_RECEIPT_CACHE_SIZE:
+                self._nano_state_receipts.popitem(last=False)
+            self._pending_nano_state = None
+            return dict(result)
+
+    @staticmethod
+    def _wait_nano_event(event: EventRequest) -> None:
+        assert event.receipt is not None
+        if not event.receipt.done.wait(timeout=TRIGGER_WRITE_TIMEOUT_SECONDS):
+            raise TriggerPendingError("Nano state is awaiting logger confirmation; retry the same event")
+        if event.receipt.error is not None:
+            raise SessionError(f"Nano state was not recorded: {event.receipt.error}") from event.receipt.error
+
+    def stop_session(
+        self, *, timeout: float = 5.0, cancel_event: threading.Event | None = None
+    ) -> Path:
         if self.state not in (AgentState.RECORDING, AgentState.TRIGGERED):
             raise SessionError(f"cannot stop a session while state is {self.state}")
 
         self._stop_event.set()
         self.daq.stop()
-        try:
-            self._join_thread(self._acquisition_thread, timeout, "acquisition")
-        finally:
-            self.daq.close()
+        # Never unmap a native buffer while the acquisition thread can still
+        # read it. Finish the HDF5 logger before closing the USB driver: its
+        # STOP ioctl may wedge, but the already acquired data must stay usable.
+        self._join_thread(self._acquisition_thread, timeout, "acquisition")
 
         if self._logger_thread is not None and self._logger_thread.is_alive():
             try:
@@ -472,6 +760,17 @@ class TmsAgent:
             except queue.Full as exc:
                 raise SessionError("logger did not drain its queue") from exc
         self._join_thread(self._logger_thread, timeout, "logger")
+        if self.health["logger"] != "FAILED":
+            self.health["logger"] = "COMPLETE"
+
+        try:
+            self.daq.close()
+        except Exception as exc:
+            self._record_failure(exc, "daq")
+            raise DaqError(f"USB-4704 close failed; run DAQ 초기화: {exc}") from exc
+        if cancel_event is not None and cancel_event.is_set():
+            self.health["daq"] = "FAILED"
+            raise DaqError("USB-4704 stop timed out; run DAQ 초기화")
 
         self.state = AgentState.COMPLETE
         if self.health["daq"] != "FAILED":
@@ -499,13 +798,14 @@ class TmsAgent:
             try:
                 block = self.daq.read_block()
                 self._last_block_monotonic = time.monotonic()
-                self.ring_buffer.append(block)
-                self._publish_telemetry(block)
                 try:
                     self._logger_queue.put_nowait(block)
+                    self._latest_queued_sample_index = block.last_sample_index
                 except queue.Full:
                     self._dropped_blocks += 1
                     self.health["logger"] = "FAILED"
+                self.ring_buffer.append(block)
+                self._publish_telemetry(block)
             except DaqStopped:
                 if not self._stop_event.is_set():
                     self._record_failure(DaqError("DAQ stopped unexpectedly"), "daq")
@@ -543,7 +843,15 @@ class TmsAgent:
                             item.sample_index,
                             receive_time=item.receive_time,
                             details=item.details,
+                            force_flush=item.receipt is not None,
                         )
+                        if item.receipt is not None:
+                            item.receipt.done.set()
+                except Exception as exc:
+                    if isinstance(item, EventRequest) and item.receipt is not None:
+                        item.receipt.error = exc
+                        item.receipt.done.set()
+                    raise
                 finally:
                     self._logger_queue.task_done()
         except Exception as exc:  # noqa: BLE001 - logger thread boundary
@@ -551,6 +859,16 @@ class TmsAgent:
             self._stop_event.set()
         finally:
             self._logger.close()
+            # Unconsumed events cannot be acknowledged after a writer error.
+            while True:
+                try:
+                    pending = self._logger_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(pending, EventRequest) and pending.receipt is not None:
+                    pending.receipt.error = SessionError("logger stopped before writing the event")
+                    pending.receipt.done.set()
+                self._logger_queue.task_done()
 
     def _recover_daq(self, original_failure: DaqError) -> bool:
         latest_sample = self.latest_sample_index
@@ -666,6 +984,7 @@ class TmsAgent:
         self.health[component] = "FAILED"
 
     def _publish_telemetry(self, block: DaqBlock) -> None:
+        block = replace(block, session_id=self._session_id)
         with self._telemetry_lock:
             subscribers = tuple(self._telemetry_queues)
         for subscriber in subscribers:

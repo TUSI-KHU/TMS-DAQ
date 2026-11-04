@@ -34,7 +34,8 @@ __pycache__/
 *.order
 *.symvers
 .*.cmd
-
+*.csv
+*.h5
 # Editor and desktop metadata
 .DS_Store
 Thumbs.db

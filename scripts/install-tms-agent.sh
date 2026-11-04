@@ -53,6 +53,8 @@ install -m 0755 "${PROJECT_ROOT}/scripts/reset-usb4704-on-start.sh" \
   "${INSTALL_ROOT}/bin/reset-usb4704-on-start.sh"
 install -m 0755 "${PROJECT_ROOT}/scripts/recover-usb4704.sh" \
   "${INSTALL_ROOT}/bin/recover-usb4704.sh"
+install -m 0755 "${PROJECT_ROOT}/scripts/probe-usb4704-ready.sh" \
+  "${INSTALL_ROOT}/bin/probe-usb4704-ready.sh"
 hub_power_source="${PROJECT_ROOT}/scripts/usb-hub-power-cycle.c"
 hub_power_binary="${INSTALL_ROOT}/bin/usb-hub-power-cycle"
 if [[ ! -f "${hub_power_source}" ]]; then
@@ -71,7 +73,9 @@ install -m 0644 "${PROJECT_ROOT}/packaging/tms-network-failover.service" \
   /etc/systemd/system/tms-network-failover.service
 usermod -a -G plugdev tms
 systemctl daemon-reload
-systemctl enable --now tms-network-failover.service
+if command -v nmcli >/dev/null && systemctl is-active --quiet NetworkManager; then
+  systemctl enable --now tms-network-failover.service
+fi
 systemctl enable tms-agent.service
 systemctl restart tms-agent.service
 

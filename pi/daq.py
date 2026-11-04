@@ -28,6 +28,7 @@ class DaqBlock:
     sample_rate: int
     channel_numbers: tuple[int, ...]
     raw_samples: NDArray[np.integer]
+    session_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.sequence < 0 or self.first_sample_index < 0:
@@ -247,7 +248,10 @@ class Usb4704DaqSource:
     def close(self) -> None:
         native, self._native = self._native, None
         if native is not None:
-            native.close()
+            try:
+                native.close()
+            except (OSError, Usb4704NativeError) as exc:
+                raise DaqError(f"USB-4704 close failed; run DAQ 초기화: {exc}") from exc
 
     def recover(self) -> None:
         if self._stop_event.is_set():

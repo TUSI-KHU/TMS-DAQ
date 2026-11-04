@@ -28,6 +28,8 @@ settle_seconds=${USB4704_RECOVERY_SETTLE_SECONDS:-3}
 stop_timeout_seconds=${USB4704_STOP_TIMEOUT_SECONDS:-20}
 post_power_stop_timeout_seconds=${USB4704_POST_POWER_STOP_TIMEOUT_SECONDS:-10}
 ready_timeout_seconds=${USB4704_RECOVERY_READY_TIMEOUT_SECONDS:-15}
+ready_probe=${USB4704_READY_PROBE:-/opt/tusi-tms/bin/probe-usb4704-ready.sh}
+lock_file=${USB4704_RECOVERY_LOCK_FILE:-/run/lock/tms-usb4704-recovery.lock}
 restart_agent_on_exit=0
 
 log() {
@@ -37,6 +39,14 @@ log() {
 warn() {
     log "WARNING: $*"
 }
+
+# Never let two UI instances stop/restart and power-cycle the same device at
+# once. Keep the lock for the complete hardware and input-verification path.
+exec 9>"$lock_file"
+if ! flock -n 9; then
+    log "ERROR: DAQ recovery is already in progress"
+    exit 5
+fi
 
 warn_if_undervoltage_recorded() {
     if ! command -v journalctl >/dev/null 2>&1; then
@@ -184,6 +194,7 @@ discover_usb4704_topology() {
 deauthorize_devices() {
     local index authorized_file
     for index in "${!device_names[@]}"; do
+        [[ ${hub_power_cycled[$index]:-0} == "1" ]] && continue
         authorized_file=${authorized_files[$index]}
         if [[ -w "$authorized_file" ]]; then
             log "logically disconnecting ${device_names[$index]}"
@@ -273,8 +284,10 @@ discover_usb4704_topology
 if (( ${#device_names[@]} == 0 )); then
     warn "no attached USB-4704 was found; recovery can only reload modules and restart the agent"
 else
-    deauthorize_devices
+    # Power recovery must not be held hostage by a driver disconnect callback
+    # waiting on the same wedged ioctl. Try the independent hub control first.
     power_cycle_hub_ports
+    deauthorize_devices
     reauthorize_devices
 fi
 
@@ -300,8 +313,13 @@ if ! start_agent; then
 fi
 
 if wait_for_daq "$ready_timeout_seconds"; then
-    log "RECOVERY_RESULT=DAQ_READY"
-    exit 0
+    if [[ -x "$ready_probe" ]] && "$ready_probe"; then
+        log "RECOVERY_RESULT=DAQ_READY"
+        exit 0
+    fi
+    log "ERROR: daq node exists, but buffered input/stop verification failed"
+    log "RECOVERY_RESULT=DAQ_UNRESPONSIVE"
+    exit 6
 fi
 
 log "RECOVERY_RESULT=DAQ_MISSING"

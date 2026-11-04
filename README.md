@@ -52,11 +52,18 @@ Dashboard가 password SSH 인증, local tunnel, Nano Serial 및 Pi telemetry를
 ./scripts/run-tms-dashboard.sh
 ```
 
-실행 스크립트가 노트북 유선 NIC를 `10.47.0.1`, Pi `eth0`을
-`10.47.0.2`로 설정하고 `tms-agent`가 실행 중인지 확인한다. 정상 실행 중인
-agent는 재시작하지 않는다. Pi는 유선 링크가
-살아 있는 동안 Wi-Fi를 내려 동일 IP 충돌을 막고, 케이블이 빠지면 저장된
-`TUSI_wifi` 프로필로 자동 복귀한다.
+실행 스크립트가 노트북 유선 NIC를 `10.47.0.1`로 설정한다. 고정 DHCP 범위를
+지원하는 NetworkManager에서는 직결 Pi에 `10.47.0.2`를 할당하므로, Pi가
+초기 DHCP 설정으로 부팅되어도 SSH에 접근할 수 있다. Pi의 NetworkManager
+환경은 고정 IP로 설정하고, Ubuntu Server의 `systemd-networkd` 환경은
+기존 DHCP 설정을 유지한다. 노트북 NetworkManager가 고정 DHCP 범위를
+지원하지 않으면 Pi에 `10.47.0.2`가 미리 설정되어 있어야 한다.
+
+이어 이미 설치된 `tms-agent`가 실행 중인지 확인하며, 정상 실행 중인 agent는
+재시작하지 않는다. Pi의 NetworkManager 환경에 Wi-Fi fallback 서비스가
+설치된 경우에만 유선 연결 시 Wi-Fi를 내리고 케이블 분리 시 저장된
+`TUSI_wifi` 프로필로 복귀한다. Dashboard의 DAQ 데이터는 두 환경 모두
+`10.47.0.2`로 향하는 전용 유선 경로를 사용한다.
 접속 정보는 폐쇄망 고정값 `tms@10.47.0.2:22`이며, GUI가 Pi의
 `tms-agent`에 SSH local tunnel로 연결한다. `--direct-telemetry`는 현장
 운용에 사용하지 않는다.
@@ -185,6 +192,14 @@ Dashboard의 **DAQ 초기화** 버튼은 telemetry `PING`에 의존하지 않는
 허브는 ganged power이므로 같은 허브의 다른 downstream USB 장치도 잠깐
 재시작될 수 있다.
 
+초기화 중에는 자동 telemetry 재접속을 잠시 멈추며 기존 SSH 터널은 유지한다.
+`/dev/daq0` 생성만으로 성공을 판정하지 않고 AI0·AI1 buffered 입력 취득/종료를
+두 번 연속 검증한 뒤 Dashboard 재연결까지 확인한다. 오류 알림은 단일 비모달
+창으로 표시하므로 X로 닫을 수 있고, 연결 재시도마다 다시 뜨지 않는다.
+측정 시작/종료 확인을 기다리는 동안 중복 조작을 차단하고, 세션 ID가 다른
+화면용 데이터는 폐기한다. 종료 시에는 USB close 전에 HDF5 파일을 마감하며
+종료 watchdog이 실패하면 다음 취득을 허용하지 않고 초기화 필요 상태로 둔다.
+
 USB-4704는 USB bus-powered, 최대 500 mA 장치다. Pi kernel에
 `Undervoltage detected`가 기록되면 소프트웨어 복구만으로는 안정성을 보장할 수
 없다. 정격 Raspberry Pi 전원(5 V/3 A 이상)과 짧고 굵은 케이블을 사용하고,
@@ -217,6 +232,40 @@ Linux 번들의 NumPy/캘리브레이션 압축 아카이브까지 확인하려�
 `TUSI-TMS self-test: calibration path OK`가 출력되어야 한다.
 
 ## Nano firmware 빌드
+
+### 점화 감지 및 CSV 기록
+
+Nano는 점화를 **제어하지 않고**, D5 입력의 HIGH/LOW를 계속 읽는다.
+경로는 `Nano → 노트북 USB serial → SSH → Pi HDF5 → 노트북 CSV`이다.
+측정 중에는 ARM 승인 여부나 첫 점화 여부와 무관하게 HIGH/LOW 상태를 저장한다.
+상태가 LOW→HIGH로 바뀌면 첫 전환을 점화 기준으로 삼는다. 처음부터 HIGH라면
+HIGH 상태만 기록하고, 언제 켜졌는지 알 수 없으므로 점화 시점을 만들지 않는다.
+Pi의 이벤트 기록·flush 확인 후에만 `Trigger: SAMPLE ...`로 표시한다.
+종료/저장을 누르면 해당 세션의 H5 원본과 CSV를 `logs/`에 자동 저장한다.
+기존 파일은 보존하고 저장 실패 시 `Pi 로그 가져오기`로 재시도할 수 있다.
+
+- `ignition=1`: 점화 신호가 연결된 단 하나의 샘플 행. 이 행의 `time_s=0`.
+- `ignition_recorded=1`: 점화 이벤트가 있는 파일. 없으면 전체 행이 0이고
+  `time_reference=acquisition_start`, 즉 취득 시작 기준이다.
+- `acquisition_time_s`: 점화 유무와 무관한 취득 시작 기준 시간.
+- `nano_gpio`: 최근 확인한 LOW=0/HIGH=1을 유지한 상태. 수신 전·연결 단절·
+  유효기간 만료는 빈칸이며 LOW로 간주하지 않는다.
+- `nano_gpio_valid`: 해당 상태가 유효하면 1, 미확인이면 0.
+- `nano_gpio_observed`: 실제 상태 보고가 연결된 샘플 행이면 1.
+- 원본 H5의 `nano_state` 이벤트에 반복 HIGH/LOW 보고와 수신 시각을 보존한다.
+  펌웨어 1.1은 500 ms마다 HB, 양방향 전환이 20 ms 안정되면 즉시 STATE를
+  보낸다. CSV는 보고 사이의 마지막 값을 유지한 것이며 DAQ 속도로 D2를
+  직접 샘플링한 값이 아니다. 새 보고가 최대 2초 없으면 미확인으로 바뀐다.
+- 점화 행의 `ignition_source=nano`, `nano_sequence`, `nano_uptime_ms`,
+  `ignition_receive_time_utc`로 신호 출처와 노트북 수신 시각을 확인한다.
+- `time_reference=ignition_receipt`,
+  `ignition_timing_basis=pi_latest_sample_on_receipt`는 Pi가 이벤트를 처리할 때의
+  최신 로깅 샘플을 뜻한다. Nano의 20 ms debounce와 USB/SSH/DAQ 블록 지연이
+  포함되며 하드웨어 동기화된 실제 점화 에지 시각은 아니다. 통신 재시도 시
+  추가 지연될 수 있고, `nano_uptime_ms`는 UTC나 DAQ 클록이 아니다.
+
+점화 이벤트가 없는 과거 로그에 점화 시점을 임의로 추가하지 않는다.
+과거 이벤트의 Nano 출처 정보가 없다면 CSV에도 `unknown`으로 남긴다.
 
 `arduino-cli`와 `arduino:avr` core가 준비된 환경에서 다음 명령으로 컴파일한다.
 

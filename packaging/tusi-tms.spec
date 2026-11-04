@@ -24,7 +24,10 @@ analysis = Analysis(
     [str(project_root / "laptop" / "main.py")],
     pathex=[str(project_root)],
     binaries=runtime_binaries,
-    datas=[(str(project_root / "config.example.yaml"), ".")],
+    datas=[
+        (str(project_root / "config.example.yaml"), "."),
+        (str(project_root / "laptop" / "gui" / "assets"), "laptop/gui/assets"),
+    ],
     hiddenimports=["asyncssh", "serial", "h5py", "pyqtgraph"],
     hookspath=[],
     runtime_hooks=[],

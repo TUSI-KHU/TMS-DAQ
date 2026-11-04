@@ -96,7 +96,12 @@ int daq_fai_xfer_complete_4702(struct urb *urb, void *context)
 
    //daq_trace((KERN_INFO "recved data: %d, status: %d\n", urb->actual_length, urb->status));
    if (urb->status){
-      schedule_work(&daq_dev->fai_stop_work);
+      /* usb_kill_urb() during normal STOP is not a new hardware failure.
+       * Queuing stop_work here lets an old session stop the next START. */
+      if (urb->status != -ENOENT && urb->status != -ECONNRESET
+         && urb->status != -ESHUTDOWN) {
+         schedule_work(&daq_dev->fai_stop_work);
+      }
       return DAQ_UR_BREAK;
    }
 
@@ -180,7 +185,9 @@ int daq_fai_xfer_complete_4702(struct urb *urb, void *context)
    }
    spin_unlock_irqrestore(&daq_dev->fai_lock, flags);
 
-   if (faiStatus->AcqMode == DAQ_ACQ_INFINITE) {
+   if (faiStatus->AcqMode == DAQ_ACQ_INFINITE
+      && READ_ONCE(daq_dev->fai_hwflag_supported)
+      && time_after_eq(jiffies, READ_ONCE(daq_dev->fai_next_hwflag_check))) {
       schedule_work(&daq_dev->fai_check_work);
    }
 
@@ -218,7 +225,10 @@ int daq_fai_xfer_complete_4704(struct urb *urb, void *context)
 
    //daq_trace((KERN_INFO "recved data: %d, status: %d\n", urb->actual_length, urb->status));
    if (urb->status){
-      schedule_work(&daq_dev->fai_stop_work);
+      if (urb->status != -ENOENT && urb->status != -ECONNRESET
+         && urb->status != -ESHUTDOWN) {
+         schedule_work(&daq_dev->fai_stop_work);
+      }
       return DAQ_UR_BREAK;
    }
 
@@ -298,7 +308,9 @@ int daq_fai_xfer_complete_4704(struct urb *urb, void *context)
    }
    spin_unlock_irqrestore(&daq_dev->fai_lock, flags);
 
-   if (faiStatus->AcqMode == DAQ_ACQ_INFINITE) {
+   if (faiStatus->AcqMode == DAQ_ACQ_INFINITE
+      && READ_ONCE(daq_dev->fai_hwflag_supported)
+      && time_after_eq(jiffies, READ_ONCE(daq_dev->fai_next_hwflag_check))) {
       schedule_work(&daq_dev->fai_check_work);
    }
 
@@ -344,20 +356,27 @@ void daq_ai_initialize_hw(daq_device_t *daq_dev)
    shared->AiLogChanCount = daq_ai_calc_log_chan_count(shared->AiChanType, AI_CHL_COUNT);
 }
 
-void daq_fai_stop_acquisition(daq_device_t *daq_dev, int cleanup)
+int daq_fai_stop_acquisition(daq_device_t *daq_dev, int cleanup)
 {
    DEVICE_SHARED *shared = &daq_dev->shared;
    unsigned long flags;
+   int ret = 0;
 
+   mutex_lock(&daq_dev->fai_stop_lock);
    spin_lock_irqsave(&daq_dev->fai_lock, flags);
    if (shared->FaiStatus.FnState != DAQ_FN_RUNNING){
       spin_unlock_irqrestore(&daq_dev->fai_lock, flags);
    } else {
-      shared->FaiStatus.FnState = DAQ_FN_STOPPED;
       spin_unlock_irqrestore(&daq_dev->fai_lock, flags);
 
+      /* Keep bulk IN requests draining until firmware acknowledges STOP.
+       * Killing the reader first can wedge this full-speed device while its
+       * ADC is still producing data, including its endpoint-0 control pipe. */
+      ret = daq_usb_fai_stop(daq_dev);
+      spin_lock_irqsave(&daq_dev->fai_lock, flags);
+      shared->FaiStatus.FnState = DAQ_FN_STOPPED;
+      spin_unlock_irqrestore(&daq_dev->fai_lock, flags);
       daq_usb_reader_stop(&daq_dev->usb_reader);
-      daq_usb_fai_stop(daq_dev);
 
       daq_device_signal_event(daq_dev, KdxAiStopped);
       wake_up_interruptible(&daq_dev->fai_queue);
@@ -370,14 +389,27 @@ void daq_fai_stop_acquisition(daq_device_t *daq_dev, int cleanup)
       daq_dev->shared.FaiStatus.FnState = DAQ_FN_IDLE;
       spin_unlock_irqrestore(&daq_dev->fai_lock, flags);
    }
+   mutex_unlock(&daq_dev->fai_stop_lock);
+   return ret < 0 ? ret : 0;
 }
 
 void daq_fai_check_work_func(struct work_struct *work)
 {
    daq_device_t *daq_dev = container_of(work, daq_device_t, fai_check_work);
+   int ret;
 
-   if (daq_dev->shared.FaiStatus.FnState == DAQ_FN_RUNNING){
-      daq_usb_dev_get_flag(daq_dev, &daq_dev->shared.FaiStatus.HwFlag);
+   if (daq_dev->shared.FaiStatus.FnState == DAQ_FN_RUNNING
+      && READ_ONCE(daq_dev->fai_hwflag_supported)) {
+      WRITE_ONCE(daq_dev->fai_next_hwflag_check, jiffies + msecs_to_jiffies(250));
+      ret = daq_usb_dev_get_flag(daq_dev, &daq_dev->shared.FaiStatus.HwFlag);
+      if (ret == -EPIPE) {
+         /* This firmware STALLs the optional GET_USB_FLAG request. Retrying
+          * it for every bulk completion floods endpoint 0 and eventually
+          * prevents STOP/CLOSE/OPEN. Keep host-buffer overrun detection,
+          * but explicitly report that firmware FIFO flags are unavailable. */
+         WRITE_ONCE(daq_dev->fai_hwflag_supported, 0);
+         pr_warn("bio4704: GET_USB_FLAG unsupported (STALL); firmware FIFO-overrun status unavailable, host-buffer overrun detection remains active\n");
+      }
    }
 }
 
@@ -558,6 +590,11 @@ int daq_ioctl_fai_start(daq_device_t *daq_dev, unsigned long arg)
    unsigned long  flags;
    int            ret = 0;
 
+   /* Drain callbacks from the preceding acquisition before setting RUNNING.
+    * Otherwise stale stop/check work can act on this session's new buffer. */
+   cancel_work_sync(&daq_dev->fai_stop_work);
+   cancel_work_sync(&daq_dev->fai_check_work);
+
    spin_lock_irqsave(&daq_dev->fai_lock, flags);
    do{
       if (shared->FaiStatus.FnState == DAQ_FN_IDLE){
@@ -673,12 +710,12 @@ int daq_ioctl_fai_stop(daq_device_t *daq_dev, unsigned long arg)
 {
    DEVICE_SHARED *shared = &daq_dev->shared;
 
+   cancel_work_sync(&daq_dev->fai_stop_work);
+   cancel_work_sync(&daq_dev->fai_check_work);
+
    if (shared->FaiStatus.FnState == DAQ_FN_IDLE){
       return 0;
    }
 
-   daq_fai_stop_acquisition(daq_dev, arg & FAI_STOP_FREE_RES);
-
-   return 0;
+   return daq_fai_stop_acquisition(daq_dev, arg & FAI_STOP_FREE_RES);
 }
-

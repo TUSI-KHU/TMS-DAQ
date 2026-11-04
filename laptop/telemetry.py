@@ -47,6 +47,8 @@ class TelemetryClient:
         self._latest_block: TelemetryBlock | None = None
         self._latest_block_monotonic: float | None = None
         self.dropped_blocks = 0
+        self.session_id: str | None = None
+        self.stream_generation = 0
 
     @property
     def connected(self) -> bool:
@@ -91,6 +93,8 @@ class TelemetryClient:
             raise TelemetryError("agent did not send a HELLO message")
         self._hello = hello.body
         self._latest_health = dict(hello.body.get("status", {}))
+        self.session_id = self._latest_health.get("session_id")
+        self._clear_blocks()
         self._latest_block = None
         self._latest_block_monotonic = None
         self._block_received.clear()
@@ -101,6 +105,7 @@ class TelemetryClient:
 
     async def disconnect(self) -> None:
         self._connected = False
+        self._clear_blocks()
         current = asyncio.current_task()
         if self._receive_task is not None and self._receive_task is not current:
             self._receive_task.cancel()
@@ -190,6 +195,7 @@ class TelemetryClient:
     async def start_session(
         self, test_name: str, timeout: float = 10.0
     ) -> dict[str, Any]:
+        self._clear_blocks()
         response = await self._request(
             MessageType.START_SESSION, {"test_name": test_name}, timeout=timeout
         )
@@ -204,15 +210,65 @@ class TelemetryClient:
         # COMPLETE acknowledgement rather than reporting a false stop error.
         return (await self._request(MessageType.STOP_SESSION, timeout=timeout)).body
 
-    async def trigger(self, receive_time: str, timeout: float = 5.0) -> int:
+    async def trigger(
+        self,
+        receive_time: str | None = None,
+        timeout: float = 5.0,
+        *,
+        session_id: str | None = None,
+        source: str | None = None,
+        nano_sequence: int | None = None,
+        nano_uptime_ms: int | None = None,
+    ) -> int:
+        body = {
+            key: value
+            for key, value in {
+                "receive_time": receive_time,
+                "session_id": session_id,
+                "source": source,
+                "nano_sequence": nano_sequence,
+                "nano_uptime_ms": nano_uptime_ms,
+            }.items()
+            if value is not None
+        }
         response = await self._request(
             MessageType.TRIGGER,
-            {"receive_time": receive_time},
+            body,
             timeout=timeout,
         )
         if response.message_type != MessageType.TRIGGER_ACK:
             raise TelemetryError("agent returned an invalid trigger response")
         return int(response.body["trigger_sample"])
+
+    async def nano_state(
+        self,
+        *,
+        session_id: str,
+        gpio_state: bool | None,
+        nano_sequence: int | None,
+        nano_uptime_ms: int | None,
+        receive_time: str,
+        event_id: str,
+        valid_for_ms: int = 2000,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Persist one observed level (or loss of a trustworthy Nano level)."""
+        response = await self._request(
+            MessageType.NANO_STATE,
+            {
+                "session_id": session_id,
+                "gpio_state": gpio_state,
+                "nano_sequence": nano_sequence,
+                "nano_uptime_ms": nano_uptime_ms,
+                "receive_time": receive_time,
+                "event_id": event_id,
+                "valid_for_ms": valid_for_ms,
+            },
+            timeout=timeout,
+        )
+        if response.message_type != MessageType.ACK:
+            raise TelemetryError("agent returned an invalid Nano state response")
+        return response.body
 
     async def _request(
         self,
@@ -256,6 +312,27 @@ class TelemetryClient:
                 elif message.message_type == MessageType.HEALTH:
                     self._latest_health = message.body
                 elif message.request_id and message.request_id in self._pending:
+                    if message.message_type == MessageType.ACK:
+                        command = message.body.get("command")
+                        if command == MessageType.START_SESSION.value:
+                            self.session_id = message.body.get("session_id")
+                            self._clear_blocks()
+                        elif command == MessageType.STOP_SESSION.value:
+                            self._clear_blocks()
+                        if command in (MessageType.START_SESSION.value, MessageType.STOP_SESSION.value):
+                            # Periodic HEALTH can still be the previous idle/
+                            # recording snapshot for 500 ms after this ACK.
+                            # Never let it undo an acknowledged UI transition.
+                            self._latest_health = {
+                                **self._latest_health,
+                                "state": message.body.get("state"),
+                                "session_id": self.session_id,
+                                "health": {
+                                    **self._latest_health.get("health", {}),
+                                    "daq": "RUNNING" if command == MessageType.START_SESSION.value else "READY",
+                                    "logger": "RECORDING" if command == MessageType.START_SESSION.value else "COMPLETE",
+                                },
+                            }
                     future = self._pending[message.request_id]
                     if not future.done():
                         future.set_result(message)
@@ -268,7 +345,17 @@ class TelemetryClient:
             self._connection_lost.set()
             self._fail_pending(TelemetryError(f"telemetry connection lost: {failure}"))
 
+    def _clear_blocks(self) -> None:
+        self.stream_generation += 1
+        self._latest_block = None
+        self._latest_block_monotonic = None
+        self._block_received.clear()
+        while not self._data_queue.empty():
+            self._data_queue.get_nowait()
+
     def _queue_block(self, block: TelemetryBlock) -> None:
+        if block.session_id is not None and block.session_id != self.session_id:
+            return
         self._latest_block = block
         self._latest_block_monotonic = time.monotonic()
         self._block_received.set()

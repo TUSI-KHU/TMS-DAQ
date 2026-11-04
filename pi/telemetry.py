@@ -37,6 +37,7 @@ IDLE_STREAM_POLL_INTERVAL_SEC = 0.01
 # stuck kernel ioctl returns a useful recovery-required error before the
 # dashboard's own request timeout, instead of later starting a stale session.
 START_SESSION_OPERATION_TIMEOUT_SEC = 8.0
+STOP_SESSION_OPERATION_TIMEOUT_SEC = 20.0
 CALIBRATION_OPERATION_GRACE_SEC = 5.0
 POWER_DIAGNOSTIC_HINT = (
     "Pi undervoltage 또는 USB 전원/케이블 불안정 여부를 확인하십시오."
@@ -127,7 +128,7 @@ class TelemetryServer:
                     {
                         "service": "tms-agent",
                         "protocol_version": 1,
-                        "status": self.agent.status_snapshot(),
+                        "status": self._status_snapshot(),
                     },
                 )
             )
@@ -175,7 +176,7 @@ class TelemetryServer:
                 await client.send(
                     WireMessage(
                         MessageType.ACK,
-                        {"status": self.agent.status_snapshot()},
+                        {"status": self._status_snapshot()},
                         request_id=request_id,
                     )
                 )
@@ -214,7 +215,11 @@ class TelemetryServer:
                         )
                     )
                 elif message.message_type == MessageType.STOP_SESSION:
-                    path = await asyncio.to_thread(self.agent.stop_session)
+                    path = await self._run_bounded_hardware_command(
+                        MessageType.STOP_SESSION.value,
+                        self.agent.stop_session,
+                        timeout=STOP_SESSION_OPERATION_TIMEOUT_SEC,
+                    )
                     await client.send(
                         WireMessage(
                             MessageType.ACK,
@@ -227,8 +232,16 @@ class TelemetryServer:
                         )
                     )
                 elif message.message_type == MessageType.TRIGGER:
-                    sample = self.agent.record_trigger(
-                        receive_time=str(message.body.get("receive_time") or "") or None
+                    # A trigger ACK means the event has reached and been
+                    # flushed by the logger, not merely entered its queue.
+                    # Waiting for that receipt must not block health/PING.
+                    sample = await asyncio.to_thread(
+                        self.agent.record_trigger,
+                        receive_time=message.body.get("receive_time"),
+                        session_id=message.body.get("session_id"),
+                        source=message.body.get("source"),
+                        nano_sequence=message.body.get("nano_sequence"),
+                        nano_uptime_ms=message.body.get("nano_uptime_ms"),
                     )
                     await client.send(
                         WireMessage(
@@ -236,6 +249,20 @@ class TelemetryServer:
                             {"trigger_sample": sample},
                             request_id=request_id,
                         )
+                    )
+                elif message.message_type == MessageType.NANO_STATE:
+                    result = await asyncio.to_thread(
+                        self.agent.record_nano_state,
+                        session_id=message.body.get("session_id"),
+                        gpio_state=message.body.get("gpio_state"),
+                        nano_sequence=message.body.get("nano_sequence"),
+                        nano_uptime_ms=message.body.get("nano_uptime_ms"),
+                        receive_time=message.body.get("receive_time"),
+                        event_id=message.body.get("event_id"),
+                        valid_for_ms=message.body.get("valid_for_ms", 2000),
+                    )
+                    await client.send(
+                        WireMessage(MessageType.ACK, result, request_id=request_id)
                     )
                 elif message.message_type == MessageType.CALIBRATION_SAMPLE:
                     duration_ms = int(message.body.get("duration_ms", 1000))
@@ -353,7 +380,7 @@ class TelemetryServer:
         if self._hardware_recovery_required is not None:
             raise DaqError(
                 "USB-4704 recovery is required after "
-                f"{self._hardware_recovery_required} timed out. "
+                f"{self._hardware_recovery_required} did not complete safely. "
                 "Run DAQ 초기화 before starting or calibrating again. "
                 + POWER_DIAGNOSTIC_HINT
             )
@@ -378,6 +405,11 @@ class TelemetryServer:
                 "Run DAQ 초기화; a delayed command will not start a session. "
                 + POWER_DIAGNOSTIC_HINT
             ) from exc
+        except (DaqError, SessionError) as exc:
+            # A failed cleanup must not leave an apparently reusable device.
+            if isinstance(exc, DaqError) or command_name == MessageType.STOP_SESSION.value:
+                self._hardware_recovery_required = command_name
+            raise
 
     @staticmethod
     def _consume_timed_out_command_result(task: asyncio.Task[Any]) -> None:
@@ -393,6 +425,7 @@ class TelemetryServer:
         pending: list[DaqBlock] = []
         last_send = time.monotonic()
         previous_block: DaqBlock | None = None
+        session_id = self.agent.session_id
         thrust_filter = FirstOrderLowPass(
             self.config.daq.sample_rate,
             self.config.low_pass.cutoff_hz,
@@ -404,6 +437,14 @@ class TelemetryServer:
             self.config.low_pass.enabled,
         )
         while True:
+            if session_id != self.agent.session_id:
+                # An old display batch can outlive STOP/START acknowledgements.
+                # Do not relabel that batch as belonging to the new session.
+                session_id = self.agent.session_id
+                pending.clear()
+                previous_block = None
+                thrust_filter.reset()
+                pressure_filter.reset()
             try:
                 block = subscriber.get_nowait()
             except queue.Empty:
@@ -427,6 +468,9 @@ class TelemetryServer:
                     continue
                 remaining = TELEMETRY_BATCH_INTERVAL_SEC - (now - last_send)
                 await asyncio.sleep(min(0.005, remaining))
+                continue
+
+            if block.session_id != session_id:
                 continue
 
             # A dropped transport block must stay visible as an index gap in
@@ -466,8 +510,15 @@ class TelemetryServer:
         while True:
             await asyncio.sleep(self.health_interval_sec)
             await client.send(
-                WireMessage(MessageType.HEALTH, self.agent.status_snapshot())
+                WireMessage(MessageType.HEALTH, self._status_snapshot())
             )
+
+    def _status_snapshot(self) -> dict[str, Any]:
+        status = self.agent.status_snapshot()
+        if self._hardware_recovery_required is not None:
+            status["recovery_required"] = self._hardware_recovery_required
+            status["health"] = {**status["health"], "daq": "FAILED"}
+        return status
 
     def _telemetry_message(
         self,
@@ -501,6 +552,7 @@ class TelemetryServer:
             sample_rate=block.sample_rate,
             channel_names=("thrust_N", "pressure_bar"),
             values=values,
+            session_id=block.session_id,
         )
 
     @staticmethod
@@ -510,6 +562,7 @@ class TelemetryServer:
             and following.first_sample_index == previous.last_sample_index + 1
             and following.sample_rate == previous.sample_rate
             and following.channel_numbers == previous.channel_numbers
+            and following.session_id == previous.session_id
         )
 
     @staticmethod
@@ -528,4 +581,5 @@ class TelemetryServer:
             raw_samples=np.concatenate(
                 [block.raw_samples for block in blocks], axis=0
             ),
+            session_id=first.session_id,
         )

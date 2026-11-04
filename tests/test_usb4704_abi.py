@@ -13,6 +13,7 @@ from pi.usb4704 import (
     FaiConfig,
     FaiStatus,
     Usb4704BufferedDevice,
+    Usb4704NativeError,
 )
 
 
@@ -59,3 +60,25 @@ def test_probe_of_missing_device_is_safe(tmp_path) -> None:
 
     assert not result.available
     assert result.reason
+
+
+def test_native_stop_error_is_not_silently_reported_as_success(monkeypatch):
+    device = Usb4704BufferedDevice(
+        "/dev/daq0", sample_rate=1000, channel_numbers=(0, 1),
+        block_frames=10, buffer_seconds=1,
+    )
+    device._fd = 123
+    device._libc = object()
+    device._running = True
+    closed = []
+
+    def failed_stop(*_args):
+        raise OSError(110, "Connection timed out")
+
+    monkeypatch.setattr(device, "_ioctl_value", failed_stop)
+    monkeypatch.setattr("pi.usb4704.os.close", closed.append)
+    with pytest.raises(Usb4704NativeError, match="STOP failed"):
+        device.close()
+    assert closed == [123]
+    assert device._fd is None
+    assert not device._running

@@ -117,6 +117,9 @@ static int __devinit daq_device_probe(struct usb_interface *interface, const str
    spin_lock_init(&daq_dev->dev_lock);
 
    spin_lock_init(&daq_dev->fai_lock);
+   mutex_init(&daq_dev->fai_stop_lock);
+   daq_dev->fai_hwflag_supported = 1;
+   daq_dev->fai_next_hwflag_check = jiffies;
    init_waitqueue_head(&daq_dev->fai_queue);
    DAQ_INIT_WORK(&daq_dev->fai_check_work, daq_fai_check_work_func);
    DAQ_INIT_WORK(&daq_dev->fai_stop_work,  daq_fai_stop_work_func);
@@ -189,6 +192,10 @@ void daq_device_cleanup(daq_device_t * daq_dev)
 {
    // Clean up any allocated resources and stuff here.
    daq_usb_reader_cleanup(&daq_dev->usb_reader);
+   /* No queued callback may dereference daq_dev after kfree below. */
+   cancel_work_sync(&daq_dev->fai_stop_work);
+   cancel_work_sync(&daq_dev->fai_check_work);
+   mutex_destroy(&daq_dev->fai_stop_lock);
 
    daq_sysfs_dev_destroy(daq_dev->sysfs);
    daq_devid_free(daq_dev->cdev.dev);

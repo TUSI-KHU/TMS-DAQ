@@ -302,11 +302,12 @@ class Usb4704BufferedDevice:
         raise InterruptedError("USB-4704 read interrupted")
 
     def close(self) -> None:
+        stop_failure: Exception | None = None
         if self._fd is not None and self._running and self._libc is not None:
             try:
                 self._ioctl_value(IOCTL_FAI_STOP, FAI_STOP_FREE_RES)
-            except (OSError, Usb4704NativeError):
-                pass
+            except (OSError, Usb4704NativeError) as exc:
+                stop_failure = exc
         self._running = False
         self._shared = None
         if self._status_map is not None:
@@ -319,6 +320,8 @@ class Usb4704BufferedDevice:
             os.close(self._fd)
             self._fd = None
         self._libc = None
+        if stop_failure is not None:
+            raise Usb4704NativeError(f"USB-4704 STOP failed: {stop_failure}") from stop_failure
 
     def _configure_single_ended_channels(self) -> None:
         configs = (AiChannelConfig * AI_CHANNEL_COUNT)(

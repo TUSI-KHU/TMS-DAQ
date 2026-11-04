@@ -1,0 +1,12 @@
+[Unit]
+Description=One-time TUSI SSH account setup from SD recovery
+Wants=network-online.target
+After=network-online.target cloud-final.service ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tms-firstboot-ssh-setup
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

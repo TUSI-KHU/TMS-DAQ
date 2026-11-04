@@ -64,6 +64,9 @@ typedef struct daq_device
    spinlock_t           dev_lock;
 
    spinlock_t           fai_lock;
+   struct mutex         fai_stop_lock;
+   int                  fai_hwflag_supported;
+   unsigned long        fai_next_hwflag_check;
    daq_umem_t           fai_buffer;
    wait_queue_head_t    fai_queue;
    struct work_struct   fai_check_work;
@@ -97,7 +100,7 @@ int  daq_device_clear_event(daq_device_t *daq_dev, unsigned index);
 // ai.c
 //
 void daq_ai_initialize_hw(daq_device_t *daq_dev);
-void daq_fai_stop_acquisition(daq_device_t *daq_dev, int cleanup);
+int daq_fai_stop_acquisition(daq_device_t *daq_dev, int cleanup);
 void daq_fai_check_work_func(struct work_struct *work);
 void daq_fai_stop_work_func(struct work_struct *work);
 int  daq_ioctl_ai_set_channel(daq_device_t *daq_dev, unsigned long arg);

@@ -271,6 +271,7 @@ class Hdf5SessionLogger:
         *,
         receive_time: str | None = None,
         details: str = "",
+        force_flush: bool = False,
     ) -> None:
         self._require_open()
         dataset = self._datasets["events"]
@@ -282,7 +283,11 @@ class Hdf5SessionLogger:
             (receive_time or utc_now()).encode("utf-8")[:40],
             details.encode("utf-8")[:256],
         )
-        self._flush_if_due()
+        if force_flush:
+            self._require_open().flush()
+            self._last_flush = time.monotonic()
+        else:
+            self._flush_if_due()
 
     def record_health(self, component: str, level: str, message: str) -> None:
         self._require_open()

@@ -3,12 +3,12 @@
 
 #include <Arduino.h>
 
-constexpr uint8_t IGNITION_PIN = 2;
+constexpr uint8_t IGNITION_PIN = 5;
 constexpr unsigned long DEBOUNCE_MS = 20;
 constexpr unsigned long HEARTBEAT_MS = 500;
 constexpr size_t COMMAND_BUFFER_SIZE = 64;
 
-bool armed = true;
+bool armed = false;
 bool rawState = LOW;
 bool stableState = LOW;
 unsigned long rawChangedAt = 0;
@@ -19,6 +19,15 @@ size_t commandLength = 0;
 
 void sendHeartbeat(unsigned long now) {
   Serial.print(F("HB,"));
+  Serial.print(++sequenceNumber);
+  Serial.print(',');
+  Serial.print(now);
+  Serial.print(',');
+  Serial.println(stableState == HIGH ? 1 : 0);
+}
+
+void sendState(unsigned long now) {
+  Serial.print(F("STATE,"));
   Serial.print(++sequenceNumber);
   Serial.print(',');
   Serial.print(now);
@@ -47,6 +56,9 @@ void handleCommand(const char *command) {
   armed = true;
   Serial.print(F("ARMED,"));
   Serial.println(sessionId);
+  // Report the present level even if HIGH predates ARM. This is a snapshot,
+  // not a newly observed rising edge and must not generate a TRIGGER.
+  sendState(millis());
 }
 
 void readCommands() {
@@ -85,6 +97,8 @@ void updateIgnition(unsigned long now) {
       sendTrigger(now);
       armed = false;
     }
+    // Continue reporting both edges after the legacy TRIGGER has latched.
+    sendState(now);
   }
 }
 
@@ -95,12 +109,12 @@ void setup() {
   stableState = rawState;
   rawChangedAt = millis();
   lastHeartbeatAt = millis();
-  Serial.println(F("HELLO,1.0"));
+  Serial.println(F("HELLO,1.2"));
 }
 
 void loop() {
-  const unsigned long now = millis();
   readCommands();
+  const unsigned long now = millis();
   updateIgnition(now);
   if (now - lastHeartbeatAt >= HEARTBEAT_MS) {
     lastHeartbeatAt = now;

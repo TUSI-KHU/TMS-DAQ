@@ -29,6 +29,7 @@ class MessageType(str, Enum):
     DAQ_DATA = "DAQ_DATA"
     TRIGGER = "TRIGGER"
     TRIGGER_ACK = "TRIGGER_ACK"
+    NANO_STATE = "NANO_STATE"
     CONFIG = "CONFIG"
     CALIBRATION_SAMPLE = "CALIBRATION_SAMPLE"
     SET_THRUST_CALIBRATION = "SET_THRUST_CALIBRATION"
@@ -53,6 +54,7 @@ class TelemetryBlock:
     sample_rate: int
     channel_names: tuple[str, ...]
     values: NDArray[np.float32]
+    session_id: str | None = None
 
     @property
     def sample_count(self) -> int:
@@ -125,6 +127,7 @@ def make_daq_data_message(
     sample_rate: int,
     channel_names: tuple[str, ...],
     values: NDArray[np.floating],
+    session_id: str | None = None,
 ) -> WireMessage:
     matrix = np.asarray(values, dtype="<f4", order="C")
     if matrix.ndim != 2 or matrix.shape[1] != len(channel_names):
@@ -138,6 +141,7 @@ def make_daq_data_message(
             "sample_count": int(matrix.shape[0]),
             "channel_names": list(channel_names),
             "dtype": "<f4",
+            "session_id": session_id,
         },
         payload=matrix.tobytes(order="C"),
     )
@@ -164,6 +168,7 @@ def decode_daq_data(message: WireMessage) -> TelemetryBlock:
             sample_rate=int(body["sample_rate"]),
             channel_names=channel_names,
             values=values,
+            session_id=body.get("session_id"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, ProtocolError):

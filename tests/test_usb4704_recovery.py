@@ -1,6 +1,9 @@
 import os
+import fcntl
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "recover-usb4704.sh"
@@ -13,7 +16,8 @@ def _tool(directory: Path, name: str, body: str) -> Path:
     return path
 
 
-def test_recovery_power_cycles_parent_hub_and_restarts_agent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("probe_exit", [0, 1])
+def test_recovery_power_cycles_parent_hub_and_restarts_agent(tmp_path: Path, probe_exit: int) -> None:
     devices = tmp_path / "devices"
     hub = devices / "1-1"
     hub.mkdir(parents=True)
@@ -52,6 +56,7 @@ def test_recovery_power_cycles_parent_hub_and_restarts_agent(tmp_path: Path) -> 
         "printf 'udevadm %s\\n' \"$*\" >> \"$CALLS\"\nexit 0",
     )
     startup_reset = _tool(tools, "startup-reset", "exit 0")
+    probe = _tool(tools, "ready-probe", f"exit {probe_exit}")
 
     result = subprocess.run(
         ["bash", str(SCRIPT), str(daq)],
@@ -65,6 +70,8 @@ def test_recovery_power_cycles_parent_hub_and_restarts_agent(tmp_path: Path) -> 
             "USB4704_HUB_POWER_CYCLE_BIN": str(hub_power),
             "USB4704_UDEVADM_BIN": str(udevadm),
             "USB4704_STARTUP_RESET_SCRIPT": str(startup_reset),
+            "USB4704_READY_PROBE": str(probe),
+            "USB4704_RECOVERY_LOCK_FILE": str(tmp_path / "recovery.lock"),
             "USB4704_RECOVERY_REAUTHORIZE_SETTLE_SECONDS": "0",
             "USB4704_RECOVERY_SETTLE_SECONDS": "0",
             "USB4704_STOP_TIMEOUT_SECONDS": "0",
@@ -76,7 +83,7 @@ def test_recovery_power_cycles_parent_hub_and_restarts_agent(tmp_path: Path) -> 
         },
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == (0 if probe_exit == 0 else 6), result.stderr
     assert daq.exists()
     assert (device / "authorized").read_text(encoding="ascii") == "1\n"
     logged = calls.read_text(encoding="utf-8")
@@ -87,4 +94,18 @@ def test_recovery_power_cycles_parent_hub_and_restarts_agent(tmp_path: Path) -> 
     assert "systemctl start --no-block tms-agent.service" in logged
     assert "systemctl is-active --quiet tms-agent.service" in logged
     assert "usbreset" not in logged.lower()
-    assert "RECOVERY_RESULT=DAQ_READY" in result.stderr
+    assert ("RECOVERY_RESULT=DAQ_READY" in result.stderr) == (probe_exit == 0)
+    if probe_exit:
+        assert "RECOVERY_RESULT=DAQ_UNRESPONSIVE" in result.stderr
+
+
+def test_recovery_rejects_concurrent_reset(tmp_path: Path) -> None:
+    lock = tmp_path / "recovery.lock"
+    with lock.open("w") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            ["bash", str(SCRIPT)], capture_output=True, text=True, timeout=2,
+            env={**os.environ, "USB4704_RECOVERY_LOCK_FILE": str(lock)},
+        )
+    assert result.returncode == 5
+    assert "already in progress" in result.stderr

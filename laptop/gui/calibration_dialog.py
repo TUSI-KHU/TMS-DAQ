@@ -30,6 +30,7 @@ from laptop.calibration import (
     fit_load_cell_calibration,
     fit_pressure_calibration,
 )
+from laptop.gui.theme import apply_theme
 
 
 class LoadCellCalibrationDialog(QDialog):
@@ -42,8 +43,9 @@ class LoadCellCalibrationDialog(QDialog):
         self, *, current_scale: float, current_offset: float, parent=None
     ) -> None:
         super().__init__(parent)
+        apply_theme(self)
         self.setWindowTitle("AI0 로드셀 실행 전 캘리브레이션")
-        self.setMinimumWidth(760)
+        self.setMinimumWidth(880)
         self._current_scale = current_scale
         self._current_offset = current_offset
         self._captured: dict[int, dict[str, float | int]] = {}
@@ -56,26 +58,25 @@ class LoadCellCalibrationDialog(QDialog):
         self._fit: LoadCellCalibration | None = None
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
         intro = QLabel(
-            "AI0은 CAS BCL-50L 로드셀로 고정되어 있습니다. 실제 장착 지그를 "
-            "포함한 상태에서, 각 기준 질량을 올린 뒤 안정화된 원시 ADC 평균을 "
-            "취득합니다. 이 과정은 짧게 AI만 읽고 Trigger/AO/DO는 동작시키지 않습니다."
+            "AI0 · CAS BCL-50L  |  기준 질량을 올리고 안정화 후 취득"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         warning = QLabel(
-            "센서/앰프 전원이 켜지고 배선이 확인된 뒤 실행하십시오. "
-            "전원이 꺼진 현재 상태의 값은 보정값으로 저장하면 안 됩니다."
+            "취득 전 센서·앰프 전원을 켜십시오."
         )
         warning.setWordWrap(True)
-        warning.setStyleSheet("color: #da1e28; font-weight: bold;")
+        warning.setStyleSheet("color: #ffc43d;")
         layout.addWidget(warning)
 
         settings = QFormLayout()
         self.point_count = QComboBox()
-        self.point_count.addItem("2점 보정 (두 기준 질량)", 2)
-        self.point_count.addItem("3점 보정 (세 기준 질량 · 최소제곱)", 3)
+        self.point_count.addItem("2점 보정", 2)
+        self.point_count.addItem("3점 보정", 3)
         self.capture_duration = QSpinBox()
         self.capture_duration.setRange(100, 10_000)
         self.capture_duration.setValue(1_000)
@@ -89,8 +90,11 @@ class LoadCellCalibrationDialog(QDialog):
             ("기준점", "질량", "AI0 평균", "AI0 표준편차", "원시값 취득")
         )
         self.reference_table.verticalHeader().setVisible(False)
+        self.reference_table.verticalHeader().setDefaultSectionSize(54)
+        self.reference_table.setMinimumHeight(220)
         self.reference_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         header = self.reference_table.horizontalHeader()
+        header.setMinimumSectionSize(80)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -101,6 +105,7 @@ class LoadCellCalibrationDialog(QDialog):
         action_layout = QGridLayout()
         self.calculate_button = QPushButton("보정값 계산")
         self.apply_button = QPushButton("AI0 보정값을 Pi에 저장")
+        self.apply_button.setProperty("role", "primary")
         self.apply_button.setEnabled(False)
         action_layout.addWidget(self.calculate_button, 0, 0)
         action_layout.addWidget(self.apply_button, 0, 1)
@@ -112,7 +117,7 @@ class LoadCellCalibrationDialog(QDialog):
         )
         self.result_label.setWordWrap(True)
         self.result_label.setStyleSheet(
-            "background: #edf5ff; border-radius: 4px; padding: 8px; color: #0043ce;"
+            "background: #252629; border: 1px solid #4a4c52; padding: 12px; color: #e8e9ed;"
         )
         layout.addWidget(self.result_label)
 
@@ -144,6 +149,7 @@ class LoadCellCalibrationDialog(QDialog):
         self._mean_labels.clear()
         self._stddev_labels.clear()
         self._capture_buttons.clear()
+        self.reference_table.setRowCount(0)
         self.reference_table.setRowCount(point_count)
         for row, mass_g in enumerate(defaults):
             label = QTableWidgetItem(f"기준 {row + 1}")
@@ -212,7 +218,8 @@ class LoadCellCalibrationDialog(QDialog):
             "mean": mean,
             "stddev": stddev,
         }
-        self._mean_labels[row].setText(f"{mean:.3f} count ({sample_count:,} samples)")
+        self._mean_labels[row].setText(f"{mean:.3f} count")
+        self._mean_labels[row].setToolTip(f"{sample_count:,} samples")
         self._stddev_labels[row].setText(f"σ {stddev:.3f} count")
         self._capture_buttons[row].setEnabled(True)
         self._pending_row = None
@@ -307,18 +314,16 @@ class PressureCalibrationDialog(LoadCellCalibrationDialog):
         intro = self.layout().itemAt(0).widget()
         if isinstance(intro, QLabel):
             intro.setText(
-                f"AI1은 4–20 mA 압력센서의 {self._shunt_ohms:g} Ω 션트 전압을 읽습니다. "
-                f"예상 입력은 {self._loop_min_mA:g} mA → "
-                f"{self._loop_min_mA / 1000.0 * self._shunt_ohms:.3f} V, "
-                f"{self._loop_max_mA:g} mA → "
-                f"{self._loop_max_mA / 1000.0 * self._shunt_ohms:.3f} V입니다. "
-                "압력을 안정화한 뒤 실제 기준압력을 입력하고 원시 ADC 평균을 취득하십시오."
+                f"AI1 · {self._loop_min_mA:g}–{self._loop_max_mA:g} mA · "
+                f"{self._shunt_ohms:g} Ω  |  "
+                f"{self._loop_min_mA / 1000.0 * self._shunt_ohms:.3f} V – "
+                f"{self._loop_max_mA / 1000.0 * self._shunt_ohms:.3f} V"
             )
         self.reference_table.setHorizontalHeaderLabels(
             ("기준점", "기준압력", "AI1 평균 (전압/전류)", "AI1 표준편차", "원시값 취득")
         )
+        self.setMinimumWidth(1000)
         self.apply_button.setText("AI1 압력 보정값을 Pi에 저장")
-        self._rebuild_reference_rows()
 
     def _rebuild_reference_rows(self) -> None:
         point_count = int(self.point_count.currentData())
@@ -330,6 +335,7 @@ class PressureCalibrationDialog(LoadCellCalibrationDialog):
         self._mean_labels.clear()
         self._stddev_labels.clear()
         self._capture_buttons.clear()
+        self.reference_table.setRowCount(0)
         self.reference_table.setRowCount(point_count)
         for row, pressure_bar in enumerate(defaults):
             self.reference_table.setItem(row, 0, QTableWidgetItem(f"기준 {row + 1}"))
@@ -382,9 +388,9 @@ class PressureCalibrationDialog(LoadCellCalibrationDialog):
         voltage = raw_code_to_voltage(mean)
         current = raw_code_to_current_mA(mean, self._shunt_ohms)
         self._mean_labels[row].setText(
-            f"{mean:.3f} count · {voltage:.4f} V / {current:.3f} mA "
-            f"({sample_count:,} samples)"
+            f"{mean:.3f} count\n{voltage:.4f} V / {current:.3f} mA"
         )
+        self._mean_labels[row].setToolTip(f"{sample_count:,} samples")
         self._stddev_labels[row].setText(f"σ {stddev:.3f} count")
         self._capture_buttons[row].setEnabled(True)
         self._pending_row = None
