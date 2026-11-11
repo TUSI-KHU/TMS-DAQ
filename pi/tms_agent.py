@@ -17,6 +17,7 @@ from typing import Any, TypeAlias
 import numpy as np
 
 from common.config import ChannelConfig, ConfigError, TmsConfig, load_config
+from common.filtering import DEFAULT_MOVING_WINDOW_SAMPLES, MovingAverage
 from pi.daq import (
     DaqBlock,
     DaqError,
@@ -152,6 +153,7 @@ class TmsAgent:
         self._telemetry_lock = threading.Lock()
         self._telemetry_queues: set[queue.Queue[DaqBlock]] = set()
         self._telemetry_dropped_blocks = 0
+        self._moving_filters = (MovingAverage(), MovingAverage())
         self._last_block_monotonic: float | None = None
         self._last_health_refresh = 0.0
         self._storage_free_bytes: int | None = None
@@ -214,6 +216,8 @@ class TmsAgent:
             "logger_dropped_blocks": self._dropped_blocks,
             "telemetry_dropped_blocks": self._telemetry_dropped_blocks,
             "sample_rate": self.config.daq.sample_rate,
+            "display_filter": "moving_average",
+            "moving_average_window_samples": DEFAULT_MOVING_WINDOW_SAMPLES,
             "low_pass": {
                 "enabled": self.config.low_pass.enabled,
                 "cutoff_hz": self.config.low_pass.cutoff_hz,
@@ -393,6 +397,8 @@ class TmsAgent:
             raise SessionError("session start was cancelled before it started")
 
         self._stop_event.clear()
+        for filt in self._moving_filters:
+            filt.reset()
         self._failures.clear()
         self._trigger_sample = None
         self._trigger_identity = None
@@ -797,6 +803,15 @@ class TmsAgent:
         while not self._stop_event.is_set():
             try:
                 block = self.daq.read_block()
+                # Compute once before the logging/transport queues split.
+                # Every client, including late/reconnecting clients, receives
+                # exactly the same window values that are stored in HDF5.
+                indices = np.arange(block.first_sample_index, block.last_sample_index + 1)
+                values = []
+                for filt, channel in zip(self._moving_filters, (self.config.thrust, self.config.pressure)):
+                    calibrated = block.column_for_channel(channel.channel).astype(np.float64) * channel.scale + channel.offset
+                    values.append(filt.apply_indexed(calibrated, indices))
+                block = replace(block, moving_average_values=np.column_stack(values).astype(np.float32))
                 self._last_block_monotonic = time.monotonic()
                 try:
                     self._logger_queue.put_nowait(block)

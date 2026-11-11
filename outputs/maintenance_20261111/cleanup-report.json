@@ -1,0 +1,12 @@
+{
+  "removed": [
+    "/home/tms/tms-slave-source-20261111",
+    "/home/tms/tms-local-gui-source",
+    "/home/tms/tms-ma80-source",
+    "/home/tms/tms-folder-source",
+    "/home/tms/tms-before-ma80.tar.gz"
+  ],
+  "protected_files_verified": 30,
+  "protected_sha256_unchanged": true,
+  "current_source": "/home/tms/TMS-DAQ"
+}

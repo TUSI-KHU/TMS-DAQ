@@ -4,6 +4,7 @@ import asyncio
 import os
 import tempfile
 import threading
+from dataclasses import replace
 from collections.abc import Coroutine
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -27,6 +28,7 @@ class BackendSignals(QObject):
     session_stopped = Signal(object)
     calibration_sampled = Signal(object)
     calibration_saved = Signal(object)
+    calibration_profile_loaded = Signal(object)
     daq_reset_finished = Signal(object)
     system_test_finished = Signal(object)
     remote_log_downloaded = Signal(str)
@@ -43,10 +45,12 @@ class BackendRuntime:
         signals: BackendSignals,
         *,
         direct_telemetry: bool = False,
+        local_daq: bool = False,
     ) -> None:
         self.config = config
         self.signals = signals
-        self.direct_telemetry = direct_telemetry
+        self.local_daq = local_daq
+        self.direct_telemetry = direct_telemetry or local_daq
         self._loop: asyncio.AbstractEventLoop | None = None
         self._backend: DashboardBackend | None = None
         self._thread = threading.Thread(
@@ -61,6 +65,14 @@ class BackendRuntime:
     def start(self) -> None:
         self._thread.start()
         self._ready.wait(timeout=3.0)
+
+    def set_log_directory(self, directory: Path) -> None:
+        # Replace the immutable settings snapshot without stopping acquisition.
+        # An in-flight export already captured its destination in a local var,
+        # so its HDF5 and CSV stay together in the previous folder.
+        self.config = replace(
+            self.config, logging=replace(self.config.logging, directory=directory)
+        )
 
     def stop(self, timeout: float = 12.0) -> None:
         if self._loop is not None and self._backend is not None:
@@ -120,6 +132,13 @@ class BackendRuntime:
             return result
 
         self._submit(capture(), self.signals.calibration_sampled, operation="calibration")
+
+    def load_calibration_profile(self, kind: str, token: str) -> None:
+        async def load() -> dict[str, Any]:
+            response = await self._require_backend().telemetry.get_config()
+            channel = response["config"]["channels"][kind]
+            return {kind: channel, "_profile_token": token}
+        self._submit(load(), self.signals.calibration_profile_loaded, operation="calibration")
 
     def save_thrust_calibration(
         self, *, scale_N_per_count: float, offset_N: float
@@ -233,6 +252,7 @@ class BackendRuntime:
             health_callback=self.signals.health.emit,
             error_callback=self.signals.error.emit,
             direct_telemetry=self.direct_telemetry,
+            local_daq=self.local_daq,
         )
         self._ready.set()
         loop.create_task(self._backend.run())

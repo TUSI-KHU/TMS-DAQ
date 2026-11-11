@@ -54,15 +54,19 @@ from common.config import (
     save_config,
 )
 from common.protocol import TelemetryBlock
+from common.filtering import DEFAULT_MOVING_WINDOW_SAMPLES
+from laptop.analysis import read_analysis_data
+from laptop.gui.analysis_dialog import ResultAnalysisDialog
 from laptop.gui.calibration_dialog import (
     LoadCellCalibrationDialog,
     PressureCalibrationDialog,
 )
 from laptop.gui.runtime import BackendRuntime, BackendSignals
 from laptop.gui.theme import AMBER, CYAN, MUTED, PLOT, apply_theme
-from laptop.logs import list_sessions
+from laptop.logs import LogError, list_sessions
 from laptop.operator_defaults import apply_field_connection
 from laptop.system_test import SystemTestResult
+from laptop.storage import prepare_log_directory
 
 STATUS_COLORS = {
     "GREEN": "#87d99b",
@@ -117,14 +121,20 @@ class MainWindow(QMainWindow):
         config_path: Path,
         *,
         direct_telemetry: bool = False,
+        local_daq: bool = False,
         fixed_connection: bool = True,
     ) -> None:
         super().__init__()
-        self.fixed_connection = fixed_connection
-        self.config = apply_field_connection(config) if fixed_connection else config
+        self.fixed_connection = fixed_connection and not local_daq
+        self.config = apply_field_connection(config) if self.fixed_connection else config
+        if local_daq:
+            self.config = replace(
+                self.config, system=replace(self.config.system, pi_host="127.0.0.1")
+            )
         self.config_path = config_path
-        self.direct_telemetry = direct_telemetry
-        self.setWindowTitle("TUSI TMS")
+        self.local_daq = local_daq
+        self.direct_telemetry = direct_telemetry or local_daq
+        self.setWindowTitle("TUSI TMS — DAQ PC 로컬" if local_daq else "TUSI TMS")
         self.resize(1440, 940)
         self.setMinimumSize(1100, 760)
         apply_theme(self)
@@ -134,6 +144,7 @@ class MainWindow(QMainWindow):
         pg.setConfigOptions(antialias=False)
         self._signals = BackendSignals()
         self._runtime: BackendRuntime | None = None
+        self._log_directory_buttons: list[QPushButton] = []
         self._status_labels: dict[str, QLabel] = {}
         self._connection_states: dict[str, str] = {}
         self._sample_indices = np.empty(0, dtype=np.int64)
@@ -482,6 +493,7 @@ class MainWindow(QMainWindow):
             "측정 전 USB-4704 드라이버/USB 장치를 재초기화하고 /dev/daq0을 복구합니다"
         )
         layout.addWidget(self.daq_reset_button)
+        layout.addWidget(self._make_log_directory_button())
 
         layout.addStretch(1)
 
@@ -681,8 +693,8 @@ class MainWindow(QMainWindow):
         # Connection/calibration details belong in Setup, not the live view.
         if hasattr(self, "low_pass_info"):
             self.low_pass_info.setText(
-                f"{self.config.low_pass.cutoff_hz:g} Hz"
-                if self.config.low_pass.enabled else "사용 안 함"
+                f"이동평균 {DEFAULT_MOVING_WINDOW_SAMPLES}샘플 "
+                f"({DEFAULT_MOVING_WINDOW_SAMPLES / self.config.daq.sample_rate * 1000:g} ms)"
             )
 
     def _build_setup(self) -> QWidget:
@@ -729,7 +741,7 @@ class MainWindow(QMainWindow):
         )
         self.pressure_channel.setEnabled(False)
         self.log_directory = QLineEdit(str(self.config.logging.directory))
-        if self.fixed_connection:
+        if self.fixed_connection or self.local_daq:
             for widget in (
                 self.pi_host,
                 self.telemetry_port,
@@ -748,20 +760,30 @@ class MainWindow(QMainWindow):
             ("", self.remember_password),
             ("Nano 포트", self.nano_port),
         ):
-            network_form.addRow(label, widget)
+            if self.local_daq and widget in (self.ssh_port, self.ssh_id, self.ssh_password, self.remember_password):
+                widget.hide()
+                continue
+            network_form.addRow("DAQ 주소" if self.local_daq and widget is self.pi_host else label, widget)
         self.sample_rate_setup.setSuffix(" S/s")
         self.block_ms.setSuffix(" ms")
         for label, widget in (
             ("취득 속도", self.sample_rate_setup),
             ("블록 시간", self.block_ms),
-            ("저역통과필터", self.low_pass_info),
+            ("표시 · CSV · 분석 필터", self.low_pass_info),
             ("로드셀 · AI0", self.thrust_channel),
             ("압력 · AI1", self.pressure_channel),
             ("션트 저항", QLabel(f"{self.config.pressure_input.shunt_ohms:g} Ω")),
         ):
             daq_form.addRow(label, widget)
-        storage_form.addRow("폴더", self.log_directory)
-        storage_form.addRow("로그", QLabel("HDF5 · 원본 + LPF"))
+        storage_form.addRow("저장 폴더", self.log_directory)
+        storage_actions = QHBoxLayout()
+        storage_actions.addWidget(self._make_log_directory_button())
+        self.apply_log_directory_button = QPushButton("저장 위치 적용")
+        self.apply_log_directory_button.clicked.connect(self._apply_log_directory)
+        storage_actions.addWidget(self.apply_log_directory_button)
+        storage_form.addRow(storage_actions)
+        storage_form.addRow(QLabel("GUI가 실행되는 이 PC에 HDF5·CSV를 저장합니다."))
+        storage_form.addRow("로그", QLabel("HDF5 · CSV · 원본 + 80샘플 이동평균"))
         grid.addWidget(network_box, 0, 0, 2, 1)
         grid.addWidget(daq_box, 0, 1)
         grid.addWidget(storage_box, 1, 1)
@@ -799,13 +821,21 @@ class MainWindow(QMainWindow):
     def _build_logs(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        self.saved_log_directory = QLineEdit(str(self.config.logging.directory.resolve()))
+        self.saved_log_directory.setReadOnly(True)
+        location = QHBoxLayout()
+        location.addWidget(QLabel("로그 저장 위치"))
+        location.addWidget(self.saved_log_directory, 1)
+        location.addWidget(self._make_log_directory_button())
+        layout.addLayout(location)
         self.log_list = QListWidget()
         buttons = QHBoxLayout()
         refresh = QPushButton("새로고침")
         open_folder = QPushButton("폴더 열기")
         export = QPushButton("CSV 내보내기")
-        fetch = QPushButton("Pi 로그 가져오기")
-        for button in (refresh, open_folder, export, fetch):
+        self.analysis_button = QPushButton("결과 분석")
+        fetch = QPushButton("DAQ 원본 로그 가져오기" if self.local_daq else "Pi 로그 가져오기")
+        for button in (refresh, open_folder, export, fetch, self.analysis_button):
             buttons.addWidget(button)
         self.advanced_log = QTextEdit()
         self.advanced_log.setReadOnly(True)
@@ -818,6 +848,8 @@ class MainWindow(QMainWindow):
         open_folder.clicked.connect(self._open_log_folder)
         export.clicked.connect(self._export_selected_log)
         fetch.clicked.connect(self._fetch_pi_log)
+        self.analysis_button.clicked.connect(self._analyze_selected_log)
+        self.log_list.itemDoubleClicked.connect(self._analyze_selected_log)
         return page
 
     def _connect_signals(self) -> None:
@@ -830,6 +862,7 @@ class MainWindow(QMainWindow):
         self._signals.session_stopped.connect(self._session_stopped)
         self._signals.calibration_sampled.connect(self._calibration_sampled)
         self._signals.calibration_saved.connect(self._calibration_saved)
+        self._signals.calibration_profile_loaded.connect(self._calibration_profile_loaded)
         self._signals.daq_reset_finished.connect(self._daq_reset_finished)
         self._signals.system_test_finished.connect(self._system_test_finished)
         self._signals.remote_log_downloaded.connect(self._remote_log_downloaded)
@@ -844,7 +877,8 @@ class MainWindow(QMainWindow):
             self._runtime = None
             return
         self._runtime = BackendRuntime(
-            self.config, self._signals, direct_telemetry=self.direct_telemetry
+            self.config, self._signals, direct_telemetry=self.direct_telemetry,
+            local_daq=self.local_daq
         )
         self._runtime.start()
 
@@ -890,6 +924,7 @@ class MainWindow(QMainWindow):
             current_offset=self.config.thrust.offset,
             parent=self,
         )
+        dialog.load_requested.connect(self._load_calibration_profile)
         dialog.capture_requested.connect(self._capture_calibration_sample)
         dialog.save_requested.connect(self._save_thrust_calibration)
         self._calibration_dialog = dialog
@@ -915,6 +950,7 @@ class MainWindow(QMainWindow):
             loop_max_mA=self.config.pressure_input.loop_max_mA,
             parent=self,
         )
+        dialog.load_requested.connect(self._load_calibration_profile)
         dialog.capture_requested.connect(self._capture_calibration_sample)
         dialog.save_requested.connect(self._save_pressure_calibration)
         self._calibration_dialog = dialog
@@ -975,6 +1011,20 @@ class MainWindow(QMainWindow):
         if self._calibration_dialog is not None:
             self._calibration_dialog.record_capture(result)
 
+    def _load_calibration_profile(self, kind: str, token: str) -> None:
+        if self._runtime is None:
+            if self._calibration_dialog is not None:
+                self._calibration_dialog.operation_failed("DAQ PC 연결이 없습니다")
+            return
+        self._runtime.load_calibration_profile(kind, token)
+
+    def _calibration_profile_loaded(self, result: dict[str, Any]) -> None:
+        dialog = self._calibration_dialog
+        if dialog is None or result.get("_profile_token") != dialog.profile_token:
+            return
+        if dialog.profile_loaded(result):
+            self._calibration_saved(result, notify_dialog=False)
+
     def _save_thrust_calibration(
         self, scale_N_per_count: float, offset_N: float
     ) -> None:
@@ -999,7 +1049,7 @@ class MainWindow(QMainWindow):
             offset_bar=offset_bar,
         )
 
-    def _calibration_saved(self, result: dict[str, Any]) -> None:
+    def _calibration_saved(self, result: dict[str, Any], *, notify_dialog: bool = True) -> None:
         try:
             if "thrust" in result:
                 thrust = result["thrust"]
@@ -1028,7 +1078,7 @@ class MainWindow(QMainWindow):
                 "Pi에는 보정값이 저장됐지만 노트북 설정 파일 반영에 실패했습니다: "
                 f"{exc}",
             )
-        if self._calibration_dialog is not None:
+        if notify_dialog and self._calibration_dialog is not None:
             self._calibration_dialog.calibration_saved(result)
 
     def _session_started(self, result: dict[str, Any]) -> None:
@@ -1194,7 +1244,7 @@ class MainWindow(QMainWindow):
             self.pipeline_summary.setText(" · ".join(states))
         else:
             self.pipeline_summary.setText(
-                "SSH 터널과 Pi telemetry 연결을 기다리는 중입니다."
+                "로컬 DAQ 서비스 연결을 기다리는 중입니다." if self.local_daq else "SSH 터널과 Pi telemetry 연결을 기다리는 중입니다."
             )
 
     def _update_daq_reset_button(self) -> None:
@@ -1244,7 +1294,9 @@ class MainWindow(QMainWindow):
         label = self._status_labels.get(component)
         if label is None:
             return
-        names = {"Pi": "Pi", "Logger": "기록", "Disk": "저장공간"}
+        names = {"Pi": "DAQ PC" if self.local_daq else "Pi", "Logger": "기록", "Disk": "저장공간"}
+        if self.local_daq:
+            names.update(LAN="로컬 연결", SSH="연결 방식")
         states = {
             "CONNECTED": "연결됨", "DISCONNECTED": "연결 끊김",
             "CONNECTING": "연결 중", "RECONNECTING": "재연결 중",
@@ -1305,21 +1357,24 @@ class MainWindow(QMainWindow):
                 pressure_input=self.config.pressure_input,
                 low_pass=self.config.low_pass,
                 logging=LoggingConfig(
-                    directory=Path(self.log_directory.text()),
+                    directory=prepare_log_directory(self.log_directory.text()),
                     ring_buffer_sec=self.config.logging.ring_buffer_sec,
                     flush_interval_sec=self.config.logging.flush_interval_sec,
                     pi_directory=self.config.logging.pi_directory,
                 ),
             )
+            if self.local_daq:
+                new_config = replace(new_config, system=replace(new_config.system, pi_host="127.0.0.1"))
             if self.fixed_connection:
                 new_config = apply_field_connection(new_config)
             save_config(new_config, self.config_path)
-        except (ConfigError, ValueError) as exc:
+        except (ConfigError, ValueError, OSError) as exc:
             QMessageBox.critical(self, "설정 오류", str(exc))
             return
         if self._runtime is not None:
             self._runtime.stop()
         self.config = new_config
+        self._update_log_directory_display()
         self._last_sample_rate = new_config.daq.sample_rate
         self._update_quick_settings_summary()
         self._start_runtime()
@@ -1358,11 +1413,70 @@ class MainWindow(QMainWindow):
                 f"{session.sample_count:,} samples | {trigger}"
             )
 
+    def _make_log_directory_button(self) -> QPushButton:
+        button = QPushButton("저장 폴더 선택")
+        button.setToolTip(f"현재 로그 저장 위치: {self.config.logging.directory.resolve()}")
+        button.clicked.connect(self._choose_log_directory)
+        self._log_directory_buttons.append(button)
+        return button
+
+    def _choose_log_directory(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self, "HDF5·CSV 로그 저장 폴더 선택", str(self.config.logging.directory.resolve())
+        )
+        if directory:
+            self._save_log_directory(directory)
+
+    def _apply_log_directory(self) -> None:
+        self._save_log_directory(self.log_directory.text())
+
+    def _save_log_directory(self, value: str | Path) -> None:
+        try:
+            directory = prepare_log_directory(value)
+            updated = replace(self.config, logging=replace(self.config.logging, directory=directory))
+            save_config(updated, self.config_path)
+        except (ConfigError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "로그 저장 위치", f"저장 위치를 변경할 수 없습니다: {exc}")
+            return
+        self.config = updated
+        if self._runtime is not None:
+            self._runtime.set_log_directory(directory)
+        self._update_log_directory_display()
+        self._refresh_logs()
+        self._append_log(f"로그 저장 위치 설정 완료: {directory} · 다음 저장부터 적용")
+        self.statusBar().showMessage(f"로그 저장 위치를 저장했습니다: {directory}", 8000)
+
+    def _update_log_directory_display(self) -> None:
+        directory = str(self.config.logging.directory.resolve())
+        self.log_directory.setText(directory)
+        self.saved_log_directory.setText(directory)
+        for button in self._log_directory_buttons:
+            button.setToolTip(f"현재 로그 저장 위치: {directory}")
+
     def _open_log_folder(self) -> None:
         self.config.logging.directory.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(self.config.logging.directory.resolve()))
         )
+
+    def _analyze_selected_log(self, *_args: object) -> None:
+        row = self.log_list.currentRow()
+        if 0 <= row < len(self._sessions):
+            source = self._sessions[row].path
+        else:
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "결과 분석 파일 열기", str(self.config.logging.directory),
+                "TMS 로그 (*.h5 *.csv)",
+            )
+            if not filename:
+                return
+            source = Path(filename)
+        try:
+            data = read_analysis_data(source)
+        except LogError as exc:
+            QMessageBox.warning(self, "결과 분석", str(exc))
+            return
+        ResultAnalysisDialog(data, self).exec()
 
     def _export_selected_log(self) -> None:
         row = self.log_list.currentRow()
@@ -1394,7 +1508,7 @@ class MainWindow(QMainWindow):
         self._runtime.fetch_latest_remote_log(selected)
 
     def _remote_log_downloaded(self, path: str) -> None:
-        self._append_log(f"Pi log downloaded: {path}")
+        self._append_log(f"DAQ log saved: {path}")
         self._refresh_logs()
 
     def _csv_exported(self, path: str) -> None:

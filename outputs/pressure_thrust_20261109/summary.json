@@ -1,0 +1,90 @@
+{
+  "source": "/run/media/sb/bf4774dd-ff52-48ac-833f-348d007da982/home/sb/usb-4704 porting project/logs/2026-11-09_pin_control_6e7eeb77.csv",
+  "samples": 345300,
+  "duration_s": 69.0598,
+  "sample_rate_Hz": 5000.000000011653,
+  "missing_sample_indices": 0,
+  "max_time_step_s": 0.0002000000000066393,
+  "ignition_recorded": false,
+  "baseline_window_s": [
+    18,
+    21
+  ],
+  "baseline_thrust_N": 1.26408825756,
+  "baseline_pressure_bar": 0.07596093929645131,
+  "baseline_std": {
+    "thrust_N": 0.9869278017143971,
+    "pressure_bar": 2.2303908056335877,
+    "thrust_N_lpf": 0.11626041137616216,
+    "pressure_bar_lpf": 0.14917200700102365
+  },
+  "recorded_peaks": {
+    "thrust_N": {
+      "value": 74.7045,
+      "time_s": 27.223
+    },
+    "pressure_bar": {
+      "value": 16.001347,
+      "time_s": 26.9598
+    },
+    "thrust_N_lpf": {
+      "value": 71.808556,
+      "time_s": 27.1802
+    },
+    "pressure_bar_lpf": {
+      "value": 11.064288,
+      "time_s": 27.1804
+    }
+  },
+  "event_threshold_N": 3.5272233871219996,
+  "merge_gap_s": 0.03,
+  "minimum_event_duration_s": 0.02,
+  "events": [
+    {
+      "start_s": 21.9272,
+      "end_s": 21.986,
+      "duration_s": 0.05880000000000152,
+      "peak_thrust_N": 10.66902274244,
+      "peak_pressure_bar": 2.7533613607035488,
+      "impulse_Ns": 0.3226596246254778,
+      "mean_thrust_N": 5.487408582065807
+    },
+    {
+      "start_s": 23.4564,
+      "end_s": 28.632,
+      "duration_s": 5.175600000000003,
+      "peak_thrust_N": 70.54446774243999,
+      "peak_pressure_bar": 10.988327060703549,
+      "impulse_Ns": 279.8804607058325,
+      "mean_thrust_N": 54.07691102593561
+    },
+    {
+      "start_s": 30.3746,
+      "end_s": 30.7304,
+      "duration_s": 0.35579999999999856,
+      "peak_thrust_N": 37.16115874244,
+      "peak_pressure_bar": 5.901405460703549,
+      "impulse_Ns": 6.947421400250148,
+      "mean_thrust_N": 19.526198426785207
+    },
+    {
+      "start_s": 36.384,
+      "end_s": 36.4574,
+      "duration_s": 0.07339999999999947,
+      "peak_thrust_N": 9.34621774244,
+      "peak_pressure_bar": 1.6792507607035487,
+      "impulse_Ns": 0.41598458809509564,
+      "mean_thrust_N": 5.667364960423687
+    }
+  ],
+  "main_event": {
+    "start_s": 23.4564,
+    "end_s": 28.632,
+    "duration_s": 5.175600000000003,
+    "peak_thrust_N": 70.54446774243999,
+    "peak_pressure_bar": 10.988327060703549,
+    "impulse_Ns": 279.8804607058325,
+    "mean_thrust_N": 54.07691102593561
+  },
+  "main_event_lpf_correlation": 0.9881545656490008
+}

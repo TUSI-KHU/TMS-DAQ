@@ -1,1760 +1,235 @@
-# TUSI TMS Software — Codex 구현 인수인계 문서
+# TUSI TMS 현재 기능·데이터 규격
 
-## 0. 문서 목적
+기준일: **2026-11-11**. 이 문서는 현재 소스와 실장비 검증을 기술한다.
+기존 Raspberry Pi 전용 구현 요청서를 대체하며, 과거 검증 이력은
+[복구 이력](daq-session-recovery-20261104.md)에 분리한다.
 
-본 문서는 TUSI 로켓 엔진 지상시험용 TMS(Test/Telemetry Measurement System) 소프트웨어의 구현 지침이다.
+## 실행 구조와 운영 모드
 
-이번 단계에서 전체 시스템 구조와 요구사항은 이미 결정되어 있다. Codex는 새로운 아키텍처를 제안하거나 시스템을 불필요하게 복잡하게 만들지 말고, 아래 설계를 그대로 구현하는 것을 목표로 한다.
-
-특히 SSH 인증은 **SSH Key를 사용하지 않고 ID/Password 기반 인증을 사용한다.**
-
-본 시스템의 Raspberry Pi는 시험장 내부의 Laptop과 60 m Ethernet으로 직접 연결되는 폐쇄형 네트워크에서 사용되며 인터넷이나 외부 네트워크에 공개할 목적이 없다.
-
----
-
-# 1. 시스템 구성
-
-하드웨어 구성:
+실행 단위는 Nano 펌웨어, `tms-agent`, GUI 세 가지다.
 
 ```text
-Ignition Box
-    │
-    ├──> Rocket Engine Ignition
-    │
-    └──> 5V Stepdown
-              │
-              ▼
-         Arduino Nano
-              │
-          USB Serial
-              │
-              ▼
-           Laptop
-              │
-              │ 60 m Ethernet
-              │ SSH Tunnel
-              ▼
-       Raspberry Pi 4B
-        Ubuntu 22.04
-              │
-              │ USB
-              ▼
-         Advantech
-          USB-4704
-           /     \
-          /       \
-      Thrust     Pressure
-      Sensor      Sensor
+USB-4704 → buffered-AI → DAQ 서비스 → HDF5 원본
+                            ├→ loopback → DAQ PC 로컬 GUI
+                            └→ SSH 터널 → 노트북 원격 GUI
+Nano → GUI를 실행하는 PC의 USB serial → DAQ 서비스의 상태·점화 이벤트
 ```
 
-Raspberry Pi용 USB-4704 DAQ 드라이버 포팅은 이미 완료되어 있다.
+현재 DAQ PC는 Ubuntu 22.04.5 x86_64, 커널 `6.8.0-138-generic`이다.
+Raspberry Pi ARM64도 소스로 지원하며 현재 운영 PC와 구분한다.
+`pi/`와 `pi_host`, `pi_directory` 같은 이름은 호환성을 위해 유지한다.
 
-Codex는 드라이버 포팅 작업을 다시 하지 않는다.
+| 항목 | 원격 모드 | DAQ PC 로컬 모드 |
+|---|---|---|
+| 실행 | `scripts/run-tms-dashboard.sh` | `tusi-tms-local` |
+| GUI 옵션 | 기본 SSH | `--local-daq` |
+| 연결 | `10.47.0.2:22` SSH → loopback telemetry | `127.0.0.1:29100` 직접 |
+| GUI 설정 | 프로젝트 `config.yaml` | `~/.config/tusi-tms/dashboard-local.yaml` |
+| GUI 저장 | 노트북 선택 폴더 | DAQ PC 선택 폴더 |
+| 보정 원본 | DAQ PC `/etc/tusi-tms/config.yaml` | 동일 |
+| Nano 연결 | 노트북 USB | DAQ PC USB |
+| 초기화 | 독립 SSH/sudo | `pkexec` OS 인증 |
 
----
+단독 모드는 주소를 loopback으로 고정하고 SSH 연결을 만들지 않는다.
+원격 모드는 ID/Password 인증만 사용하며 기본 현장 주소·계정은
+`laptop/operator_defaults.py`가 적용한다. 개발용 `--direct-telemetry`와 구별한다.
 
-# 2. 최종 소프트웨어 구성
+## 수집과 기록 우선순위
 
-실행 단위는 최대한 단순하게 유지한다.
+- AI0 로드셀·AI1 압력 고정. 기본 5,000 samples/s/channel, 10 ms 블록(50 samples).
+- USB-4704 native buffered-AI ioctl, 사용자 버퍼, mmap 상태를 사용한다.
+  단일 샘플 polling 루프로 대체하지 않는다.
+- 인접 채널 스캔 총 속도는 `47,619 samples/s`를 넘지 않도록 설정을 검증한다.
+- 취득·logger·GUI 통신을 분리한다. 링 버퍼 기본 길이는 5초다.
+- GUI·SSH·Ethernet·Nano 장애가 DAQ 원본 기록을 중지하지 않는다.
+- logger 큐 손실은 실패로 기록한다. telemetry 큐 손실은 표시 경로의 손실이며
+  sample index의 간격으로 드러난다.
+- 측정 준비 시 파일과 취득을 시작한다. 점화 신호는 기록 시작 명령이 아니다.
+- 측정 종료는 logger를 마감한 뒤 USB close를 수행한다. STOP watchdog 실패 시
+  복구 필요 상태를 유지하고 다음 취득을 차단한다.
+
+세션 파일은 날짜·시험명·session ID로 구분하며 기존 파일을 덮어쓰지 않는다.
+새 세션과 재접속에서 오래된 블록을 새 세션으로 표시하지 않는다.
+
+## 기본 표시 필터
+
+최근 80샘플 이동평균을 후행 방식으로 계산한다.
 
 ```text
-1. nano_trigger
-   Arduino Nano firmware
-
-2. tms-agent
-   Raspberry Pi acquisition/logging/telemetry daemon
-
-3. tms-dashboard
-   Laptop GUI application
+y[n] = mean(x[max(구간 시작, n-79) : n+1])
 ```
 
-사용자가 실제로 직접 실행해야 하는 프로그램은 원칙적으로:
+입력은 보정된 추력·압력이며 LPF 출력에 이동평균을 겹쳐 적용하지 않는다.
+초기는 확보된 샘플 수로 평균내고 0을 채우지 않는다. 각 입력 샘플에 출력 하나가
+생기므로 CSV 행 수와 시간축을 바꾸지 않는다. 5 kHz 창 길이는 16 ms이고 시간
+지연을 별도로 보정하지 않는다.
+
+`common/filtering.py::MovingAverage`가 공통 구현이다. `TmsAgent`가 logger·통신
+큐로 나누기 전에 한 번 계산해 `DaqBlock.moving_average_values`에 담는다.
+logger와 모든 telemetry client는 같은 float32 배열을 사용한다. 늦게 접속한
+client도 자체 이력으로 다시 계산하지 않는다. 블록 경계는 유지하고 새 측정,
+불연속 index, 비정상 값에서 창을 초기화한다.
+
+`FirstOrderLowPass`와 `low_pass` 설정은 보관용 `_lpf` 열을 위해 남아 있으며,
+현재 기본 표시·분석 필터가 아니다.
+
+## 영구 보정
+
+로드셀·압력은 각각 원시 ADC에 대한 affine 변환이다.
 
 ```text
-TUSI TMS Dashboard
+thrust_N = raw_thrust * scale + offset
+pressure_bar = raw_pressure * scale + offset
 ```
 
-하나뿐이어야 한다.
+- 2점 또는 3점의 알려진 질량(g)/압력(bar)과 취득 원시값을 사용한다.
+- 원시값의 평균·표준편차·샘플 수를 표시하고 RMSE·잔차·R²로 계산 결과를 보여준다.
+- **설정 저장**은 DAQ PC의 파일 저장 성공 후 메모리에 적용하고 ACK를 보낸다.
+  파일 쓰기 실패를 성공처럼 표시하지 않는다.
+- 채널별 최신 scale·offset 한 개를 유지한다. 다른 센서의 보정을 바꾸지 않는다.
+- **프로파일 불러오기**는 CONFIG 조회로 서버의 현재 계수를 가져온다.
+- 닫힌 보정 창의 늦은 불러오기 응답을 다른 창에 적용하지 않는다.
+- 계수 저장은 `/etc/tusi-tms/config.yaml`, GUI 사본은 각 PC의 설정 파일에 저장한다.
+- 과거 파일에는 측정 당시 계수를 보존한다. 새 보정은 다음 측정에 적용한다.
 
-Pi에서는 `tms-agent`를 systemd service로 자동 실행한다.
+압력 션트 기본값은 100 Ω, 4–20 mA → 0.4–2.0 V다.
+기계·전기적 정확도는 별도 기준계측으로 확인해야 한다.
 
----
+## GUI와 저장 위치
 
-# 3. 핵심 설계 원칙
+주요 화면은 실시간 계측, 수집·연결, 시스템 점검, 시험 로그다. 로드셀·압력 보정은
+별도 창으로 연다. 실시간 그래프는 채널 선택·단위·현재값·피크를 표시하며 최근
+10초를 유지한다. 화면용 min/max envelope는 그리는 점 수만 줄이고 저장 샘플을
+삭제하지 않는다.
 
-다음 원칙을 반드시 지킨다.
+측정 화면·시험 로그의 **저장 폴더 선택**, 설정의 **저장 위치 적용**을 제공한다.
+선택한 경로를 절대 경로로 정규화하고 디렉터리 생성·실제 쓰기 검사를 수행한다.
+설정 저장이 성공한 뒤 GUI와 runtime의 불변 설정 사본을 교체한다.
 
-### 3.1 KISS
+- 수집·SSH 연결을 종료하거나 다시 만들지 않는다.
+- 이미 진행 중인 파일 저장은 기존 경로에 HDF5·CSV를 함께 완료한다.
+- 다음 저장은 새 폴더를 사용한다. 재실행 후에도 유지된다.
+- 취소·권한·설정 저장 실패는 이전 유효 설정을 유지한다.
+- GUI 목적지 변경은 DAQ 원본 경로를 바꾸거나 기존 파일을 이동하지 않는다.
 
-시스템을 필요 이상으로 추상화하거나 서비스 수를 늘리지 않는다.
+측정 종료 후 정확한 세션의 HDF5를 회수/복사하고 CSV를 자동 생성한다.
+원본이 정상인데 GUI 저장만 실패하면 측정 실패와 구분하고 파일명을 유지해
+재시도한다. 원격은 SFTP, 로컬은 동일 PC 파일 복사를 사용한다.
 
-금지 예:
-
-```text
-ManagerFactory
-ControllerInterface
-ServiceRegistry
-EventBus framework
-microservice architecture
-database server
-message broker
-Docker orchestration
-```
-
-이 프로젝트에는 필요 없다.
-
-읽기 쉬운 Python/C/C++ 코드와 명확한 module 분리 정도면 충분하다.
-
----
-
-### 3.2 Pi Local Logging이 최우선
-
-시험 중 데이터의 authoritative copy는 Raspberry Pi의 로그다.
-
-```text
-DAQ
- ↓
-Pi acquisition
- ↓
-Pi local logging
-```
-
-이 경로는 다음과 독립적이어야 한다.
+## HDF5와 CSV
 
 ```text
-Nano
-Laptop
-GUI
-SSH
-Ethernet
-Telemetry
-```
-
-따라서:
-
-```text
-Nano disconnect     → logging 계속
-Laptop crash        → logging 계속
-GUI crash           → logging 계속
-Ethernet disconnect → logging 계속
-SSH disconnect      → logging 계속
-```
-
-이어야 한다.
-
----
-
-### 3.3 Trigger 전에 이미 Logging 중이어야 한다
-
-점화 Trigger는 DAQ 시작 명령이 아니다.
-
-정상 흐름:
-
-```text
-측정 준비
-   ↓
-DAQ acquisition 시작
-   ↓
-Pi logging 시작
-   ↓
-계속 기록
-   ↓
-Nano Trigger
-   ↓
-점화 시점 기록
-   ↓
-계속 기록
-```
-
-Nano가 동작하지 않더라도 측정 데이터는 끝까지 남아야 한다.
-
----
-
-# 4. 점화 시점 정의
-
-점화 시점의 기준은 **Arduino Nano에서 감지한 ignition GPIO rising edge**로 한다.
-
-별도의 USB-4704 trigger channel이나 PTP/NTP hardware synchronization은 추가하지 않는다.
-
-수 ms 수준의 serial/network latency는 본 시스템의 허용 범위이다.
-
-흐름:
-
-```text
-Ignition Switch
-      ↓
-Nano GPIO HIGH
-      ↓
-Nano detects rising edge
-      ↓
-USB Serial
-      ↓
-Laptop TMS Dashboard
-      ↓
-TRIGGER message
-      ↓
-SSH tunnel
-      ↓
-Pi tms-agent
-      ↓
-현재 DAQ sample index를 trigger_sample로 기록
-```
-
-시간축:
-
-```text
-t = (sample_index - trigger_sample) / sample_rate
-```
-
-Pi가 Trigger packet을 받은 시점에서 가장 가까운 acquisition sample index를 `trigger_sample`로 기록한다.
-
-GUI 또한 해당 `trigger_sample`을 T=0으로 사용한다.
-
----
-
-# 5. Arduino Nano Firmware
-
-Nano firmware의 역할은 최대한 단순하게 한다.
-
-```text
-GPIO input
-    ↓
-debounce
-    ↓
-rising edge detection
-    ↓
-serial trigger
-```
-
-추가로 Nano 연결 상태 확인을 위한 heartbeat를 제공한다.
-
-Nano는 ignition을 제어하지 않는다.
-
-Nano는 ignition switch의 상태만 읽는다.
-
----
-
-## 5.1 GPIO
-
-외부 4.7 kΩ pull-down을 사용하는 구조다.
-
-따라서 GPIO는 일반 `INPUT`으로 사용한다.
-
-```text
-LOW  = ignition inactive
-HIGH = ignition signal detected
-```
-
----
-
-## 5.2 Trigger latch
-
-한 시험 session에서는 Trigger를 한 번만 발생시킨다.
-
-개념:
-
-```text
-armed = true
-
-if rising_edge and armed:
-    send_trigger()
-    armed = false
-```
-
-새로운 measurement session이 시작되면 다시 armed 상태가 된다.
-
----
-
-## 5.3 Serial Protocol
-
-프로토콜은 사람이 터미널에서도 읽을 수 있는 ASCII 기반으로 한다.
-
-예:
-
-```text
-HELLO,1.0
-HB,101,50000,0
-HB,102,50500,0
-TRIGGER,103,50731
-HB,104,51000,1
-```
-
-Heartbeat format:
-
-```text
-HB,<sequence>,<uptime_ms>,<gpio_state>
-```
-
-Trigger format:
-
-```text
-TRIGGER,<sequence>,<uptime_ms>
-```
-
-Baudrate:
-
-```text
-115200
-```
-
-Heartbeat 주기:
-
-```text
-500 ms
-```
-
-정도를 기본값으로 한다.
-
----
-
-# 6. Raspberry Pi — tms-agent
-
-환경:
-
-```text
-Raspberry Pi 4B
-Ubuntu 22.04
-USB-4704 driver already ported
-```
-
-`tms-agent`가 다음 기능을 담당한다.
-
-```text
-DAQ acquisition
-buffer management
-logging
-telemetry
-trigger handling
-health monitoring
-configuration
-```
-
----
-
-# 7. DAQ Acquisition
-
-USB-4704에서 sample 하나씩 polling하지 않는다.
-
-금지:
-
-```text
-read()
-sleep()
-read()
-sleep()
-```
-
-반드시 포팅된 driver가 제공하는 buffered acquisition / DMA 경로를 이용한다.
-
-전체 흐름:
-
-```text
-USB-4704
-    │
-hardware sampling
-    │
-    ▼
-Driver DMA / USB Buffer
-    │
-    ▼
-Acquisition Worker
-    │
-    ▼
-Application Ring Buffer
-    │
-    ├──> Logger
-    │
-    └──> Telemetry
-```
-
----
-
-## 7.1 Block acquisition
-
-DAQ data는 block 단위로 처리한다.
-
-예:
-
-```text
-Sample rate = 5000 Hz
-
-Block:
-    50 samples
-    10 ms
-```
-
-각 block metadata 예:
-
-```text
-sequence
-first_sample_index
-sample_count
-sample_rate
-channel_count
-raw sensor data
-```
-
-실제 block size는 configuration에서 조절 가능하게 하되 일반 사용자는 수정할 필요가 없어야 한다.
-
-기본:
-
-```text
-block_ms = 10
-```
-
-정도를 사용한다.
-
----
-
-# 8. Buffer 정책
-
-application-level ring buffer를 둔다.
-
-권장:
-
-```text
-5 seconds
-```
-
-정도의 raw acquisition data를 유지한다.
-
-역할:
-
-```text
-1. Disk writer 순간 지연 흡수
-2. Network 순간 지연 흡수
-3. Trigger 이전 데이터 GUI 표시
-```
-
-우선순위:
-
-```text
-DAQ Acquisition
-    >
-Local Logging
-    >
-Network Telemetry
-    >
-GUI Rendering
-```
-
-Network 또는 GUI가 느려지는 경우 acquisition thread를 기다리게 하면 안 된다.
-
-Telemetry frame은 필요한 경우 drop 가능하지만 local log는 최대한 보존한다.
-
----
-
-# 9. Thread 구조
-
-처음에는 단순한 thread architecture를 사용한다.
-
-```text
-Main
- │
- ├── Acquisition Thread
- ├── Logger Thread
- ├── Network Thread
- └── Health Thread
-```
-
-대략적인 data flow:
-
-```text
-             USB4704
-                │
-                ▼
-       Acquisition Thread
-                │
-                ▼
-           Ring Buffer
-             /     \
-            /       \
-           ▼         ▼
-       Logger      Network
-       Thread      Thread
-```
-
-필요하지 않으면 multiprocessing을 사용하지 않는다.
-
----
-
-# 10. Raspberry Pi Logging
-
-한 시험은 하나의 session으로 관리한다.
-
-권장 파일:
-
-```text
-YYYY-MM-DD_TESTNAME_NUMBER.h5
-```
-
-예:
-
-```text
-2026-08-23_KNSB_TEST_003.h5
-```
-
-HDF5를 기본 저장 포맷으로 사용한다.
-
----
-
-## 10.1 HDF5 기본 구조
-
-```text
-/metadata
-
-/samples
-    raw_thrust
-    raw_pressure
-    thrust_N
-    pressure_bar
-    thrust_N_lpf
-    pressure_bar_lpf
-
+/metadata  test_name, session_id, start_time, end_time, sample_rate, sample_count,
+           daq_configuration, sensor_calibration, display_filter,
+           moving_average_window_samples, software_version
+/samples/sample_index
+/samples/raw_thrust
+/samples/raw_pressure
+/samples/thrust_N
+/samples/pressure_bar
+/samples/thrust_N_ma
+/samples/pressure_bar_ma
+/samples/thrust_N_lpf
+/samples/pressure_bar_lpf
 /events
-
 /health
 ```
 
-metadata에는 최소한 다음을 기록한다.
-
-```text
-test_name
-session_id
-start_time
-sample_rate
-DAQ configuration
-sensor calibration
-low-pass filter configuration
-software version
-```
-
-Trigger event에는:
-
-```text
-event_type = ignition
-trigger_sample
-receive_time
-```
-
-등을 기록한다.
-
----
-
-# 11. Measurement Session
-
-`tms-agent` 자체는 Pi boot 시 자동 실행한다.
-
-하지만 실제 DAQ recording은 Dashboard에서:
-
-```text
-측정 준비
-```
-
-를 눌렀을 때 시작한다.
-
-흐름:
-
-```text
-Pi Boot
- ↓
-tms-agent.service
- ↓
-READY
- ↓
-
-Laptop:
-[측정 준비]
-
- ↓
-
-START_SESSION
-
- ↓
-
-DAQ acquisition
-+
-HDF5 logging
-
- ↓
-
-RECORDING
-```
-
-이후 Laptop이 죽어도 session은 Pi에서 계속 진행되어야 한다.
-
----
-
-# 12. Laptop — TMS Dashboard
-
-지원 OS:
-
-```text
-Windows
-Linux
-```
-
-가능한 한 동일한 Python codebase를 사용한다.
-
-GUI:
-
-```text
-PySide6
-```
-
-실시간 graph:
-
-```text
-pyqtgraph
-```
-
-Serial:
-
-```text
-pyserial
-```
-
-SSH:
-
-```text
-asyncssh
-```
-
-등을 사용할 수 있다.
-
----
-
-# 13. SSH 정책 — 중요
-
-## SSH Key를 사용하지 않는다.
-
-본 시스템의 SSH는 반드시:
-
-```text
-IP
-Username
-Password
-```
-
-기반으로 접속할 수 있어야 한다.
-
-예:
-
-```text
-Pi IP:       192.168.50.2
-SSH Port:    22
-SSH ID:      tms
-SSH Password: ********
-```
-
-SSH key generation, ssh-agent, public key installation 등을 사용자에게 요구하지 않는다.
-
----
-
-# 14. Raspberry Pi SSH Server
-
-Ubuntu 22.04의 OpenSSH server를 사용한다.
-
-Pi에는 TMS 전용 user를 하나 사용하는 것을 권장한다.
-
-예:
-
-```text
-username: tms
-```
-
-해당 계정에 password를 설정한다.
-
-SSH server는 password login을 허용하도록 구성한다.
-
-필요 설정 예:
-
-```text
-PasswordAuthentication yes
-```
-
-설정 변경 후 sshd를 restart한다.
-
-인터넷에 공개할 시스템이 아니므로 본 프로젝트에서는 password authentication을 정상적인 운용 방식으로 취급한다.
-
----
-
-# 15. Laptop SSH Client
-
-Dashboard 내부에서 SSH 연결을 자동으로 수행한다.
-
-사용자가 command line에서:
-
-```text
-ssh ...
-```
-
-를 입력하게 만들지 않는다.
-
-전체 과정:
-
-```text
-Dashboard
-   ↓
-read SSH settings
-   ↓
-connect using username + password
-   ↓
-create SSH tunnel
-   ↓
-connect telemetry socket
-```
-
----
-
-# 16. SSH Tunnel
-
-Pi의 `tms-agent` telemetry server는 가능하면:
-
-```text
-127.0.0.1:<TMS_PORT>
-```
-
-에만 bind한다.
-
-예:
-
-```text
-Pi:
-127.0.0.1:29100
-```
-
-Laptop Dashboard가 SSH local forwarding을 생성한다.
-
-논리적으로:
-
-```text
-Laptop
-127.0.0.1:29100
-      │
-      │ SSH Tunnel
-      ▼
-Pi
-127.0.0.1:29100
-```
-
-Dashboard의 telemetry client는 항상 localhost를 사용한다.
-
-이를 통해 Windows/Linux networking 차이를 최소화한다.
-
----
-
-# 17. SSH Authentication 구현
-
-`asyncssh` 등을 사용할 경우 반드시 password 기반 인증을 사용한다.
-
-개념적으로 필요한 값:
-
-```text
-host
-port
-username
-password
-```
-
-SSH private key를 요구하지 않는다.
-
-다음 기능도 필요하다.
-
-```text
-connect
-disconnect
-keepalive
-automatic reconnect
-connection timeout
-authentication failure reporting
-```
-
----
-
-# 18. SSH Password GUI
-
-Setup 화면에 다음 항목을 제공한다.
-
-```text
-Raspberry Pi
-
-IP Address      [ 192.168.50.2 ]
-SSH Port        [ 22           ]
-SSH ID          [ tms          ]
-SSH Password    [ ************ ]
-```
-
-Password field는 반드시 GUI에서 masked input으로 표시한다.
-
-추가 옵션:
-
-```text
-[✓] 비밀번호 저장
-```
-
-을 둘 수 있다.
-
-비전공자가 매 시험마다 SSH password를 다시 입력할 필요가 없도록 기본적으로 저장 기능을 지원하는 것이 좋다.
-
----
-
-# 19. Password 저장 정책
-
-시스템을 불필요하게 복잡하게 만들기 위해 OS keyring 같은 별도 credential framework를 필수화하지 않는다.
-
-간단한 local configuration 방식으로 충분하다.
-
-단:
-
-* GUI에는 password를 masked 처리한다.
-* 일반 log에 password를 절대 출력하지 않는다.
-* exception message에도 password를 포함하지 않는다.
-* debug dump에도 password를 넣지 않는다.
-* Linux에서는 config file permission을 가능한 경우 user-only로 제한한다.
-* Git repository에 실제 password가 들어간 config 파일을 commit하지 않는다.
-
-repository에는:
-
-```text
-config.example.yaml
-```
-
-만 둔다.
-
-실제:
-
-```text
-config.yaml
-```
-
-은 `.gitignore`에 포함한다.
-
----
-
-# 20. SSH 오류 표시
-
-GUI에는 technical traceback 대신 사람이 이해할 수 있는 메시지를 보여준다.
-
-예:
-
-```text
-SSH 연결 실패
-
-Raspberry Pi에 로그인할 수 없습니다.
-
-확인:
-1. LAN 케이블 연결
-2. Raspberry Pi 전원
-3. Pi IP 주소
-4. SSH ID
-5. SSH Password
-```
-
-인증 실패라면:
-
-```text
-SSH 인증 실패
-
-ID 또는 Password를 확인하십시오.
-```
-
-등으로 명확히 구분한다.
-
-Python traceback은 Advanced Log에서만 보여준다.
-
----
-
-# 21. SSH Reconnect
-
-Ethernet cable이 순간적으로 끊길 수 있으므로 자동 reconnect를 구현한다.
-
-예:
-
-```text
-connection lost
- ↓
-1 sec
- ↓
-retry
-
-failure
- ↓
-2 sec
- ↓
-retry
-
-failure
- ↓
-5 sec
- ↓
-retry
-```
-
-최대 backoff는 약 10초 정도면 충분하다.
-
-SSH reconnect가 진행되는 동안에도:
-
-```text
-Pi DAQ
-Pi logging
-```
-
-은 계속되어야 한다.
-
-GUI:
-
-```text
-SSH ● Reconnecting
-```
-
-정도로 표시한다.
-
----
-
-# 22. Nano Serial Manager
-
-Laptop Dashboard 내부 module로 구현한다.
-
-기능:
-
-```text
-serial port detection
-connection
-heartbeat parsing
-trigger parsing
-automatic reconnect
-Nano health
-```
-
-Windows:
-
-```text
-COMx
-```
-
-Linux:
-
-```text
-/dev/ttyUSBx
-/dev/ttyACMx
-```
-
-차이는 pyserial layer에서 처리한다.
-
-GUI에서는:
-
-```text
-Nano Port: AUTO
-```
-
-를 기본값으로 한다.
-
-필요한 경우 manual selection도 가능하게 한다.
-
----
-
-# 23. Trigger 처리
-
-Nano trigger 수신 시:
-
-```text
-Nano
- ↓
-SerialManager
- ↓
-TriggerManager
- ↓
-GUI trigger latch
- ↓
-Pi에 TRIGGER message 즉시 전송
- ↓
-Pi current sample index 기록
- ↓
-Pi ACK
- ↓
-Dashboard T=0 설정
-```
-
-Trigger는 한 session에 한 번만 인정한다.
-
----
-
-# 24. Pi ↔ Laptop Protocol
-
-SSH tunnel 위의 TCP connection 하나를 사용한다.
-
-불필요하게 여러 socket/service를 만들지 않는다.
-
-message type:
-
-```text
-HELLO
-HEALTH
-START_SESSION
-STOP_SESSION
-DAQ_DATA
-TRIGGER
-TRIGGER_ACK
-CONFIG
-ACK
-ERROR
-```
-
-정도면 충분하다.
-
----
-
-# 25. DAQ Data 전송
-
-sample 하나씩 network packet으로 보내지 않는다.
-
-block 단위로 보낸다.
-
-예:
-
-```text
-DAQ_DATA
-
-sequence
-first_sample
-sample_rate
-sample_count
-thrust data
-pressure data
-```
-
-control message는 사람이 이해하기 쉬운 구조를 사용하되 대량 sample data는 binary array로 전송한다.
-
-JSON float array로 수천 개 sample을 문자열화하지 않는다.
-
----
-
-# 26. Dashboard UI
-
-Dashboard는 비전공자에게 인수인계할 수 있는 수준으로 단순해야 한다.
-
-첫 화면 예:
-
-```text
-┌─────────────────────────────────────────────┐
-│                TUSI TMS                     │
-├─────────────────────────────────────────────┤
-│ SYSTEM STATUS                               │
-│                                             │
-│ Nano        ● Connected                     │
-│ LAN         ● Connected                     │
-│ SSH         ● Connected                     │
-│ Raspberry   ● Connected                     │
-│ DAQ         ● Running                       │
-│ Logger      ● Recording                     │
-│ Storage     ● OK                            │
-├─────────────────────────────────────────────┤
-│                                             │
-│ Test Name [ KNSB_TEST_003              ]    │
-│                                             │
-│       [ 측정 준비 ]   [ 측정 종료 ]        │
-│                                             │
-│             STATUS : ARMED                  │
-│                                             │
-├─────────────────────────────────────────────┤
-│                 THRUST                      │
-│                                             │
-│              realtime graph                 │
-│                                             │
-├─────────────────────────────────────────────┤
-│                PRESSURE                     │
-│                                             │
-│              realtime graph                 │
-│                                             │
-├────────────────────┬────────────────────────┤
-│ Current Thrust     │ Current Pressure       │
-│ Peak Thrust        │ Peak Pressure          │
-│                    │                        │
-│ T+                 │ Sample Rate            │
-└────────────────────┴────────────────────────┘
-```
-
----
-
-# 27. GUI Tabs
-
-최대 4개 정도로 유지한다.
-
-```text
-Dashboard
-Setup
-System Test
-Logs
-```
-
----
-
-## Dashboard
-
-실제 시험 운용 화면.
-
-표시:
-
-```text
-Nano
-LAN
-SSH
-Pi
-DAQ
-Logger
-Disk
-
-Thrust graph
-Pressure graph
-
-Current thrust
-Peak thrust
-Current pressure
-Peak pressure
-T+
-Sample rate
-```
-
----
-
-## Setup
-
-일반 설정:
-
-```text
-Nano Port
-
-Pi IP
-SSH Port
-SSH ID
-SSH Password
-
-Sample Rate
-
-Thrust Channel
-Thrust Scale
-Thrust Offset
-
-Pressure Channel
-Pressure Scale
-Pressure Offset
-
-Log Directory
-```
-
-일반 사용자가 YAML을 직접 수정할 필요가 없어야 한다.
-
----
-
-## System Test
-
-버튼 하나:
-
-```text
-[ 전체 시스템 점검 ]
-```
-
-결과:
-
-```text
-Nano ............. PASS
-LAN .............. PASS
-SSH .............. PASS
-Pi Agent ......... PASS
-USB4704 .......... PASS
-DAQ Stream ....... PASS
-Thrust Channel ... PASS
-Pressure Channel . PASS
-Storage .......... PASS
-```
-
-SSH 검사에는:
-
-```text
-TCP port 22 reachable
-username/password authentication successful
-SSH tunnel successful
-```
-
-을 포함한다.
-
----
-
-## Logs
-
-시험 session 목록과 최소 기능만 제공한다.
-
-```text
-시험 선택
-
-[폴더 열기]
-[CSV 내보내기]
-[Pi 로그 가져오기]
-```
-
----
-
-# 28. Health 상태
-
-색상 의미:
-
-```text
-GREEN   정상
-YELLOW  주의 / reconnecting
-RED     오류
-GRAY    비활성
-```
-
-예:
-
-```text
-Nano      ● Connected
-SSH       ● Connected
-Pi        ● Connected
-DAQ       ● 5.00 kS/s
-Logger    ● Recording
-```
-
-오류 시:
-
-```text
-Nano      ● Disconnected
-SSH       ● Reconnecting
-```
-
-처럼 보여준다.
-
----
-
-# 29. State Machine
-
-불필요하게 많은 상태를 만들지 않는다.
-
-```text
-DISCONNECTED
-      ↓
-READY
-      ↓
-RECORDING
-      ↓
-TRIGGERED
-      ↓
-COMPLETE
-```
-
-세부 장치 오류는 state를 늘리지 말고 health flag로 관리한다.
-
-예:
-
-```text
-state = RECORDING
-
-health.nano = FAILED
-health.ssh = OK
-health.daq = OK
-health.logger = OK
-```
-
-Nano failure 때문에 전체 state를 ERROR로 바꾸면 안 된다.
-
----
-
-# 30. Configuration
-
-개념적인 configuration:
-
-```yaml
-system:
-  pi_host: 192.168.50.2
-
-ssh:
-  port: 22
-  username: tms
-  password: ""
-  remember_password: true
-
-nano:
-  port: auto
-  baudrate: 115200
-
-daq:
-  sample_rate: 5000
-  block_ms: 10
-
-channels:
-  thrust:
-    channel: 0
-    scale: ...
-    offset: ...
-
-  pressure:
-    channel: 1
-    scale: ...
-    offset: ...
-
-pressure_input:
-  # 현장 배선: 4–20 mA를 100 Ω 션트로 AI1에 입력
-  shunt_ohms: 100.0
-  loop_min_mA: 4.0
-  loop_max_mA: 20.0
-
-low_pass:
-  enabled: true
-  cutoff_hz: 50.0
-
-logging:
-  ring_buffer_sec: 5
-```
-
-AI1의 100 Ω 션트에서는 4–20 mA가 0.4–2.0 V가 된다. `scale`/`offset`은
-센서의 실제 압력 범위를 알고 있는 기준압력 2점 또는 3점으로 별도 보정한다.
-저항값을 변경한 경우에는 실제 배선 상태에서 AI1 압력 보정을 다시 수행한다.
-
-실제 password가 들어간 파일은 repository에 commit하지 않는다.
-
----
-
-# 31. Repository 구조
-
-과도하게 파일을 분리하지 않는다.
-
-```text
-tusi-tms/
-│
-├── firmware/
-│   └── nano/
-│       └── nano_trigger.ino
-│
-├── pi/
-│   ├── tms_agent.py
-│   ├── daq.py
-│   ├── logger.py
-│   ├── telemetry.py
-│   └── service/
-│
-├── laptop/
-│   ├── main.py
-│   ├── nano.py
-│   ├── ssh_client.py
-│   ├── telemetry.py
-│   ├── health.py
-│   └── gui/
-│
-├── common/
-│   ├── protocol.py
-│   └── config.py
-│
-├── tests/
-│
-├── config.example.yaml
-├── README.md
-└── .gitignore
-```
-
----
-
-# 32. Pi systemd
-
-Pi 설치 후:
-
-```text
-tms-agent.service
-```
-
-를 등록한다.
-
-Pi boot:
-
-```text
-Ubuntu boot
- ↓
-network
- ↓
-tms-agent.service
- ↓
-READY
-```
-
-사용자가 Pi terminal을 직접 조작할 필요가 없어야 한다.
-
----
-
-# 33. Windows / Linux 지원
-
-Laptop code는 가능한 한 완전히 동일하게 사용한다.
-
-OS-specific 부분을 최소화한다.
-
-특히 SSH는 external command:
-
-```text
-ssh
-plink
-powershell
-```
-
-등에 의존하지 말고 Python SSH library를 사용하는 것을 우선한다.
-
-그러면 Windows/Linux 모두:
-
-```text
-host
-username
-password
-```
-
-만으로 동일한 connection code를 사용할 수 있다.
-
----
-
-# 34. Packaging
-
-최종적으로 일반 운영자는 Python 환경을 직접 관리하지 않는 방향을 목표로 한다.
-
-Windows:
-
-```text
-TUSI-TMS.exe
-```
-
-Linux:
-
-```text
-tusi-tms
-```
-
-또는 간단한 launcher.
-
-사용자 절차는:
-
-```text
-1. Raspberry Pi 전원 ON
-2. Nano USB 연결
-3. Ethernet 연결
-4. TUSI TMS 실행
-5. 전체 시스템 점검
-6. 측정 준비
-7. 점화
-8. 측정 종료
-```
-
-이면 충분해야 한다.
-
----
-
-# 35. Fault Requirement
-
-반드시 자동 테스트 또는 수동 acceptance test를 만든다.
-
-| Fault               | Required behavior             |
-| ------------------- | ----------------------------- |
-| Nano unplug         | Pi logging 계속                 |
-| Nano firmware crash | Pi logging 계속                 |
-| Laptop GUI crash    | Pi logging 계속                 |
-| Laptop shutdown     | Pi logging 계속                 |
-| Ethernet unplug     | Pi logging 계속                 |
-| SSH disconnect      | Pi logging 계속 + reconnect     |
-| Wrong SSH password  | GUI에 명확한 인증 오류                |
-| Telemetry delay     | acquisition 영향 없음             |
-| DAQ buffer pressure | health warning                |
-| DAQ overrun         | DATA_GAP event 기록             |
-| USB4704 disconnect  | DAQ error + reconnect attempt |
-| Disk low            | GUI warning                   |
-| Logger failure      | Critical RED                  |
-
----
-
-# 36. 구현 순서
-
-## Phase 1 — DAQ backend
-
-먼저 Pi에서:
-
-```text
-USB4704
- ↓
-buffer/DMA acquisition
- ↓
-ring buffer
- ↓
-HDF5 logging
-```
-
-을 완성한다.
-
-GUI부터 만들지 않는다.
-
----
-
-## Phase 2 — Nano
-
-```text
-GPIO
- ↓
-debounce
- ↓
-rising-edge
- ↓
-TRIGGER serial
-```
-
-* heartbeat.
-
----
-
-## Phase 3 — Pi telemetry
-
-```text
-DAQ
- ↓
-tms-agent
- ↓
-TCP telemetry server
-```
-
----
-
-## Phase 4 — Laptop connectivity
-
-순서:
-
-```text
-Nano serial
- ↓
-
-Pi LAN connection
- ↓
-
-SSH ID/PASSWORD authentication
- ↓
-
-SSH tunnel
- ↓
-
-Telemetry
-```
-
-CLI 수준으로 먼저 검증한다.
-
----
-
-## Phase 5 — Trigger integration
-
-```text
-Nano GPIO HIGH
- ↓
-Laptop
- ↓
-Pi
- ↓
-trigger_sample
-```
-
-이 실제 DAQ log에 정확히 기록되는지 검증한다.
-
----
-
-## Phase 6 — Dashboard
-
-검증된 backend 위에 GUI를 붙인다.
-
-GUI에서 transport 또는 acquisition logic을 직접 구현하지 않는다.
-
----
-
-## Phase 7 — Packaging / handover
-
-Windows/Linux package 생성.
-
-README에는 비전공자용 운용법을 최상단에 작성한다.
-
-상세 개발 정보는 뒤쪽에 둔다.
-
----
-
-# 37. Codex가 하지 말아야 하는 것
-
-다음 변경은 하지 않는다.
-
-```text
-SSH Key authentication으로 변경
-PKI 도입
-OAuth 도입
-TLS 인증서 관리 추가
-PTP/NTP 동기화 시스템 추가
-별도 DAQ trigger channel 추가
-데이터베이스 서버 추가
-Redis/Kafka/RabbitMQ 추가
-Docker/Kubernetes 추가
-ROS2 추가
-microservice architecture 변경
-```
-
-또한 현재 Raspberry Pi USB-4704 driver가 이미 준비된 상태이므로 자체 driver를 새로 개발하지 않는다.
-
----
-
-# 38. Coding Style
-
-코드는 다른 TUSI 구성원이 읽고 수정할 수 있어야 한다.
-
-우선순위:
-
-```text
-Readability
->
-Reliability
->
-Performance
->
-Architectural elegance
-```
-
-단, DAQ hot path에 대해서는 buffer/DMA/block processing을 사용하여 성능과 데이터 유실 방지를 보장한다.
-
-명확한 이름을 사용한다.
-
-좋음:
-
-```text
-read_daq_block()
-save_samples()
-connect_ssh()
-handle_trigger()
-update_health()
-```
-
-불필요:
-
-```text
-DataAcquisitionAbstractFactory
-TransportStrategyProvider
-TriggerEventDispatcherSingleton
-```
-
----
-
-# 39. Acceptance Criteria
-
-최종 구현 완료의 기준은 다음이다.
-
-### 기본 동작
-
-```text
-Dashboard 실행
-→ Nano 자동 연결
-→ ID/PW로 Pi SSH 자동 연결
-→ SSH tunnel 생성
-→ DAQ 상태 확인
-→ 측정 준비
-→ 지속 logging
-→ Nano Trigger
-→ T=0 생성
-→ 실시간 그래프 표시
-→ 측정 종료
-→ 로그 정상 저장
-```
-
-### 장애 시험
-
-시험 도중 Ethernet cable을 뽑는다.
-
-```text
-Dashboard:
-SSH RED/YELLOW
-
-Pi:
-DAQ 계속
-Logging 계속
-```
-
-Ethernet을 다시 연결한다.
-
-```text
-Dashboard:
-SSH 자동 reconnect
-Telemetry 자동 복구
-```
-
-시험 도중 Nano를 뽑는다.
-
-```text
-Nano RED
-DAQ 정상
-Logger 정상
-```
-
-시험 도중 Dashboard를 강제 종료한다.
-
-```text
-Pi DAQ 정상
-Pi Logger 정상
-```
-
-Dashboard를 다시 실행하면 Pi에 다시 로그인할 수 있어야 한다.
-
----
-
-# 40. 최종 설계 철학
-
-TUSI TMS 내부에는:
-
-```text
-Serial
-SSH
-TCP
-DMA
-Buffer
-Threads
-DAQ
-HDF5
-```
-
-등이 존재하지만 운영자는 이를 알 필요가 없어야 한다.
-
-운영자에게 보여야 하는 것은:
-
-```text
-Nano       ●
-Pi         ●
-DAQ        ●
-Logger     ●
-SSH        ●
-
-[전체 시스템 점검]
-
-[측정 준비]
-
-      THRUST
-       graph
-
-      PRESSURE
-       graph
-
-[측정 종료]
-```
-
-정도여야 한다.
-
-특히 SSH는 다음처럼 구현한다.
-
-```text
-사용자 관점:
-
-Pi IP
-SSH ID
-SSH Password
-
-        ↓
-
-Dashboard 내부 자동 처리
-
-        ↓
-
-SSH Connected ●
-```
-
-**SSH Key는 사용하지 않는다.**
-
-이 프로젝트의 최종 목표는 단순히 기능이 동작하는 것이 아니라, 다음 학기의 비전공자 또는 신규 TUSI 구성원이 README와 Dashboard만 보고도 시험을 수행할 수 있는 TMS를 만드는 것이다.
+모든 `/samples` 데이터셋의 길이는 같다. MA metadata는
+`display_filter=moving_average`, `moving_average_window_samples=80`이다.
+
+CSV는 다음을 포함한다.
+
+- index·시간: `sample_index`, `time_s`, `acquisition_time_s`
+- 원본: `raw_thrust`, `raw_pressure`, `thrust_N`, `pressure_bar`
+- 필터: `thrust_N_ma`, `pressure_bar_ma`, `moving_average_window_samples`,
+  `thrust_N_lpf`, `pressure_bar_lpf`
+- 점화: `ignition`, `ignition_recorded`, `time_reference`, `ignition_source`,
+  `ignition_receive_time_utc`, `nano_sequence`, `nano_uptime_ms`, `ignition_timing_basis`
+- 상태: `nano_gpio`, `nano_gpio_valid`, `nano_gpio_observed`
+
+CSV 내보내기는 chunk 사이에 이동평균 이력을 유지한다. 과거 HDF5에 MA가 없으면
+환산 원본으로 계산한다. 내보내기는 임시 파일 완성 후 목적지에 반영한다.
+
+## 결과 분석
+
+시험 로그 선택 후 **결과 분석**, 로그 더블클릭 또는 파일 선택으로 HDF5·CSV를 연다.
+`laptop/analysis.py`가 두 PC에서 같은 데이터를 생성하고
+`laptop/gui/analysis_dialog.py`가 이동평균 추력·압력과 최대·평균을 표시한다.
+점화 기록이 있으면 수신 기준 T=0, 없으면 수집 시작 기준이다.
+저장된 MA80을 우선 사용하고 과거 파일에만 원본에서 계산한다.
+누락 구간을 연속 그래프로 잇지 않는다. 확대·이동은 pyqtgraph 조작을 사용한다.
+
+## Nano와 점화 시각
+
+현재 펌웨어는 `firmware/nano/nano_trigger.ino`다.
+
+| 항목 | 값 |
+|---|---|
+| 입력 | D5, `INPUT`, 외부 4.7 kΩ pull-down |
+| 의미 | LOW=비활성, HIGH=신호 감지 |
+| debounce | 20 ms |
+| Serial | 115200 baud |
+| heartbeat | 500 ms |
+| GUI 상태 만료 | 기본 2초 |
+
+ASCII 메시지: `HELLO`, `HB,<sequence>,<uptime_ms>,<gpio>`,
+`STATE,<sequence>,<uptime_ms>,<gpio>`, `TRIGGER,<sequence>,<uptime_ms>`,
+`ARM,<session_id>`, `ARMED,<session_id>`.
+GPIO HIGH/LOW 상태 기록은 ARM 확인이나 첫 점화 여부와 독립적으로 유지한다.
+처음부터 HIGH라면 상태만 기록하고 과거 점화 에지를 만들지 않는다.
+
+서비스는 신호를 처리하는 시점의 최신 로깅 샘플에 이벤트를 연결하고 flush 후 ACK한다.
+`ignition_timing_basis=pi_latest_sample_on_receipt`는 x86_64에서도 유지하는 호환 이름이다.
+Nano uptime은 UTC나 DAQ clock이 아니며 hardware trigger/PTP 동기화는 구현하지 않는다.
+
+CSV 점화 행의 시간은 `(sample_index-trigger_sample)/sample_rate`다.
+점화가 없으면 수집 시작 기준이며 점화 시점을 임의로 추정하지 않는다.
+유효한 마지막 GPIO 상태를 보고 사이에 유지하되 수신 전·단절·만료는 빈칸으로 쓴다.
+
+## 통신·상태·복구
+
+TCP 프로토콜은 길이 헤더와 제어 메시지, float32 DAQ payload를 사용한다.
+주요 명령은 HELLO, PING, CONFIG, START_SESSION, STOP_SESSION, CALIBRATION_SAMPLE,
+SET_THRUST_CALIBRATION, SET_PRESSURE_CALIBRATION, NANO_STATE, TRIGGER다.
+서버는 HEALTH·DAQ_DATA와 request ID에 대응하는 ACK/ERROR를 반환한다.
+
+서비스 세션 상태는 READY, RECORDING, TRIGGERED, COMPLETE다. 보정 취득 중에는
+세션 상태를 유지하고 DAQ health를 CALIBRATING으로 표시한다. GUI의 DISCONNECTED와 복구 진행 상태를 별도로 관리한다.
+logger·DAQ·storage health, logger/telemetry dropped block 수, session ID를 표시한다.
+
+원격 재연결은 정상 SSH 터널을 유지하고 반복 실패 때만 교체한다. 초기화는 PING이
+응답하지 않아도 별도 제어 경로로 수행하며 중복 실행은 파일 잠금으로 막는다.
+정상 서비스 시작은 이미 있는 `/dev/daq0`를 건드리지 않는다. 노드가 없을 때만
+재인가·재열거를 시도한다. 수동 초기화는 서비스 중지·장치 복구·서비스 재시작 후
+실제 buffered-AI 취득/종료 두 번과 GUI 재연결을 확인한다.
+
+`USBDEVFS_RESET`은 이 장치에서 장시간 block된 이력이 있어 사용하지 않는다.
+일부 펌웨어가 `GET_USB_FLAG`에 STALL을 반환하면 반복 요청을 중단한다. 이 경우
+장치 내부 FIFO 초과 상태를 읽을 수 없지만 호스트 버퍼·샘플 index 검사는 유지한다.
+
+## 설정·설치 경계
+
+설정 schema는 `common/config.py`, 예제는 `config.example.yaml`이 기준이다.
+`daq.sample_rate=5000`, `daq.block_ms=10`, `logging.ring_buffer_sec=5`,
+`logging.flush_interval_sec=1`이 기본이다. 비밀번호를 포함하는 실제 설정·로그·
+가상환경은 소스 관리에서 제외한다.
+
+설치된 서비스는 `tms:plugdev`로 실행하고 `/var/lib/tusi-tms`와 `/etc/tusi-tms`에
+쓰기 권한을 갖는다. 로컬 GUI는 일반 사용자로 실행하며 초기화 때만 OS 인증한다.
+드라이버 모듈은 실행 중인 아키텍처·커널과 일치해야 한다.
+
+## 검증 기준과 현재 결과
+
+2026-11-11 자동 테스트 **196개 통과**. 주요 근거:
+
+- MovingAverage의 정확한 80샘플 창·시작·블록 경계·누락 구간 검증.
+- 늦은 client와 logger의 이동평균 배열 일치.
+- 신규·과거 HDF5/CSV 분석과 chunk 내보내기 일치.
+- 서비스 재시작 후 센서별 보정 유지·프로파일 조회.
+- 원격/로컬 저장 폴더 선택·재실행 유지·취소·권한 오류·저장 중 경로 변경.
+- 실장비 16,100샘플의 화면/HDF5/CSV/분석 일치와 두 PC CSV의 바이트 일치.
+- 실장비 폴더 선택 후 HDF5·CSV 저장 및 설정 복원 확인.
+
+센서 기준계에 의한 정확도, 실제 점화 배선, 장시간·최대 속도, 60 m 케이블 전체
+장애 시험, AO/DO·counter와 이번 변경의 Windows 실기기 시험은 완료로 간주하지 않는다.

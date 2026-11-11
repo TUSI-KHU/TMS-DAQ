@@ -84,6 +84,21 @@ def test_network_reports_rejected_password_without_retrying(tmp_path: Path) -> N
     assert "password authentication was rejected" in result.stderr
 
 
+def test_network_configures_usb_ethernet_on_pc(tmp_path: Path) -> None:
+    env = _network_tools(tmp_path)
+    tools = tmp_path / "bin"
+    ip = tools / "ip"
+    ip.write_text(ip.read_text().replace("eth0", "enx00e04c3603ee"))
+    (tools / "systemctl").write_text("#!/bin/bash\nexit 0\n")
+    subprocess.run(
+        ["bash", str(NETWORK_SCRIPT)], env=env, capture_output=True,
+        text=True, timeout=10, check=True,
+    )
+    changes = (tmp_path / "nmcli.log").read_text()
+    assert "connection.interface-name enx00e04c3603ee" in changes
+    assert "connection.interface-name eth0" not in changes
+
+
 def test_network_provisioner_help_is_non_mutating() -> None:
     result = subprocess.run(
         ["bash", str(NETWORK_SCRIPT), "--help"],
@@ -117,3 +132,17 @@ def test_dashboard_launcher_creates_fixed_operator_config(tmp_path: Path) -> Non
     assert "username: tms" in text
     assert "password: tms" in text
     assert oct(config_path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_local_launcher_needs_no_network_or_ssh(tmp_path: Path) -> None:
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    systemctl = tools / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 0\n")
+    systemctl.chmod(0o755)
+    result = subprocess.run(
+        ["/bin/bash", str(PROJECT_ROOT / "scripts/run-tms-local.sh"), "--config", "local.yaml"],
+        env={**os.environ, "PATH": str(tools), "TMS_LOCAL_PYTHON": "/bin/echo"},
+        capture_output=True, text=True, timeout=5, check=True,
+    )
+    assert result.stdout.strip() == "-m laptop.main --local-daq --config local.yaml"

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Any
+from math import isfinite
+from uuid import uuid4
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -36,6 +38,8 @@ from laptop.gui.theme import apply_theme
 class LoadCellCalibrationDialog(QDialog):
     """Collect two or three stable AI0 references and persist their fit."""
 
+    profile_kind = "thrust"
+    load_requested = Signal(str, str)
     capture_requested = Signal(int, int)
     save_requested = Signal(float, float)
 
@@ -46,6 +50,8 @@ class LoadCellCalibrationDialog(QDialog):
         apply_theme(self)
         self.setWindowTitle("AI0 로드셀 실행 전 캘리브레이션")
         self.setMinimumWidth(880)
+        self.profile_token = uuid4().hex
+        self._loaded_values = None
         self._current_scale = current_scale
         self._current_offset = current_offset
         self._captured: dict[int, dict[str, float | int]] = {}
@@ -104,9 +110,13 @@ class LoadCellCalibrationDialog(QDialog):
 
         action_layout = QGridLayout()
         self.calculate_button = QPushButton("보정값 계산")
-        self.apply_button = QPushButton("AI0 보정값을 Pi에 저장")
+        self.apply_button = QPushButton("설정 저장")
         self.apply_button.setProperty("role", "primary")
         self.apply_button.setEnabled(False)
+        self.load_button = QPushButton("프로파일 불러오기")
+        self.load_button.setToolTip("DAQ PC에 마지막 저장된 이 센서의 scale·offset을 불러옵니다")
+        self.load_button.clicked.connect(self._request_load)
+        action_layout.addWidget(self.load_button, 1, 0, 1, 2)
         action_layout.addWidget(self.calculate_button, 0, 0)
         action_layout.addWidget(self.apply_button, 0, 1)
         layout.addLayout(action_layout)
@@ -142,6 +152,7 @@ class LoadCellCalibrationDialog(QDialog):
     def _rebuild_reference_rows(self) -> None:
         point_count = int(self.point_count.currentData())
         defaults = (0.0, 3908.0) if point_count == 2 else (0.0, 550.0, 3908.0)
+        self._loaded_values = None
         self._captured.clear()
         self._fit = None
         self._pending_row = None
@@ -188,6 +199,7 @@ class LoadCellCalibrationDialog(QDialog):
         self.status_label.setText("질량을 확인하고 각 행의 원시값을 취득하십시오.")
 
     def _invalidate_fit(self) -> None:
+        self._loaded_values = None
         self._fit = None
         self.apply_button.setEnabled(False)
 
@@ -262,37 +274,75 @@ class LoadCellCalibrationDialog(QDialog):
         )
         self.apply_button.setEnabled(True)
         self.status_label.setText(
-            "계산 완료. 정상 장착·안정된 상태인지 확인한 뒤 Pi 저장을 누르십시오."
+            "계산 완료. 정상 장착·안정된 상태인지 확인한 뒤 설정 저장을 누르십시오."
         )
+
+    def _set_busy(self, busy: bool) -> None:
+        self._saving = busy
+        self.load_button.setEnabled(not busy)
+        self.calculate_button.setEnabled(not busy)
+        self.point_count.setEnabled(not busy)
+        self.reference_table.setEnabled(not busy)
+        self.apply_button.setEnabled(not busy and (self._fit is not None or self._loaded_values is not None))
+
+    def _request_load(self) -> None:
+        if self._saving or self._pending_row is not None:
+            return
+        self._set_busy(True)
+        self.status_label.setText("DAQ PC의 저장된 보정 프로파일을 불러오는 중…")
+        self.load_requested.emit(self.profile_kind, self.profile_token)
+
+    def profile_loaded(self, result: dict[str, Any]) -> bool:
+        try:
+            channel = result[self.profile_kind]
+            scale, offset = float(channel["scale"]), float(channel["offset"])
+            if not isfinite(scale) or not isfinite(offset) or scale == 0:
+                raise ValueError("유효하지 않은 보정 계수")
+            expected = 1 if self.profile_kind == "pressure" else 0
+            if int(channel["channel"]) != expected:
+                raise ValueError("센서 채널이 일치하지 않습니다")
+        except (KeyError, TypeError, ValueError) as exc:
+            self.operation_failed(str(exc))
+            return False
+        self._current_scale, self._current_offset = scale, offset
+        self._rebuild_reference_rows()
+        self._loaded_values = (scale, offset)
+        self._set_busy(False)
+        self.status_label.setText("DAQ PC의 마지막 저장 프로파일을 불러왔습니다. 기준점 재취득 없이 사용할 수 있습니다.")
+        return True
 
     def _request_save(self) -> None:
-        if self._fit is None or self._saving:
+        if self._saving or self._pending_row is not None:
             return
-        self._saving = True
-        self.apply_button.setEnabled(False)
-        self.status_label.setText("Pi 설정 파일에 AI0 보정값을 저장하는 중…")
-        self.save_requested.emit(self._fit.scale_N_per_count, self._fit.offset_N)
+        if self._loaded_values is not None:
+            values = self._loaded_values
+        elif self._fit is not None:
+            values = ((self._fit.scale_bar_per_count, self._fit.offset_bar)
+                      if self.profile_kind == "pressure"
+                      else (self._fit.scale_N_per_count, self._fit.offset_N))
+        else:
+            return
+        self._set_busy(True)
+        self.status_label.setText("DAQ PC에 보정 프로파일을 영구 저장하는 중…")
+        self.save_requested.emit(*values)
 
     def calibration_saved(self, result: dict[str, Any]) -> None:
-        self._saving = False
-        thrust = result.get("thrust", {})
-        self.status_label.setText(
-            "저장 완료. 다음 측정 세션과 HDF5 로그에 이 AI0 보정값이 적용됩니다. "
-            f"(AI{thrust.get('channel', 0)})"
-        )
-        self.apply_button.setEnabled(self._fit is not None)
+        if not self.profile_loaded(result):
+            return
+        self.status_label.setText("DAQ PC에 영구 저장 완료. 재시작 후에도 유지되며 다음 측정에 적용됩니다.")
 
     def operation_failed(self, message: str) -> None:
         if self._pending_row is not None:
             self._capture_buttons[self._pending_row].setEnabled(True)
         self._pending_row = None
-        self._saving = False
-        self.apply_button.setEnabled(self._fit is not None)
+        self._set_busy(False)
         self.status_label.setText(f"작업 실패: {message}")
 
 
 class PressureCalibrationDialog(LoadCellCalibrationDialog):
     """Collect two or three stable AI1 pressure references and persist their fit."""
+
+    profile_kind = "pressure"
 
     def __init__(
         self,
@@ -323,11 +373,12 @@ class PressureCalibrationDialog(LoadCellCalibrationDialog):
             ("기준점", "기준압력", "AI1 평균 (전압/전류)", "AI1 표준편차", "원시값 취득")
         )
         self.setMinimumWidth(1000)
-        self.apply_button.setText("AI1 압력 보정값을 Pi에 저장")
+        self.apply_button.setText("설정 저장")
 
     def _rebuild_reference_rows(self) -> None:
         point_count = int(self.point_count.currentData())
         defaults = (0.0, 1.0) if point_count == 2 else (0.0, 0.5, 1.0)
+        self._loaded_values = None
         self._captured.clear()
         self._fit = None
         self._pending_row = None
@@ -443,21 +494,4 @@ class PressureCalibrationDialog(LoadCellCalibrationDialog):
             f"RMSE={self._fit.rmse_bar:.4f} bar · R²={r_squared} · 잔차: {residuals}"
         )
         self.apply_button.setEnabled(True)
-        self.status_label.setText("계산 완료. 기준압력과 배선을 확인한 뒤 Pi 저장을 누르십시오.")
-
-    def _request_save(self) -> None:
-        if self._fit is None or self._saving:
-            return
-        self._saving = True
-        self.apply_button.setEnabled(False)
-        self.status_label.setText("Pi 설정 파일에 AI1 압력 보정값을 저장하는 중…")
-        self.save_requested.emit(self._fit.scale_bar_per_count, self._fit.offset_bar)
-
-    def calibration_saved(self, result: dict[str, Any]) -> None:
-        self._saving = False
-        pressure = result.get("pressure", {})
-        self.status_label.setText(
-            "저장 완료. 다음 측정 세션과 HDF5 로그에 AI1 압력 보정값이 적용됩니다. "
-            f"(AI{pressure.get('channel', 1)})"
-        )
-        self.apply_button.setEnabled(self._fit is not None)
+        self.status_label.setText("계산 완료. 기준압력과 배선을 확인한 뒤 설정 저장을 누르십시오.")

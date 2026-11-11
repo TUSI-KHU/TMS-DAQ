@@ -1,426 +1,159 @@
-# TUSI TMS / USB-4704 Raspberry Pi project
+# TUSI TMS / USB-4704
 
-이 저장소에는 두 작업이 함께 들어 있다.
+문서 기준: **2026-11-11**, Python 패키지 `tusi-tms 0.1.0`의 현재 작업본.
 
-1. USB-4704 Ubuntu 22.04 ARM64 커널 드라이버 포팅
-2. 포팅된 드라이버를 이용할 TUSI 시험 계측 소프트웨어
+USB-4704로 추력·압력을 수집하는 프로그램이다. 노트북에서 DAQ PC를 원격으로 조작하거나, DAQ PC에서 같은 GUI를 실행해 독립적으로 측정·저장한다. 
 
-전체 TMS 요구사항은 [시스템 요구사항](docs/system-requirements.md)에, ARM64
-드라이버 포팅 결과와 남은 검증 항목은
-[USB-4704 포팅 현황](docs/usb4704-porting-status.md)에 정리되어 있다.
+## 실행 방법
 
-## 저장소 구조
+### 노트북에서 원격 실행
 
-```text
-common/     Pi agent와 Dashboard가 공유하는 설정·프로토콜
-pi/         Raspberry Pi 수집·기록·telemetry agent
-laptop/     노트북 Dashboard와 SSH tunnel client
-firmware/   Arduino Nano trigger firmware
-vendor/     USB-4704 커널 드라이버 원본 및 포팅 대상 소스
-scripts/    빌드·설치·유선망 provision·실행 스크립트
-packaging/  systemd, udev, DKMS, PyInstaller 패키징 파일
-tools/      USB-4704 진단 도구
-tests/      하드웨어 없이 실행 가능한 자동 테스트
-docs/       시스템 요구사항과 포팅/검증 현황
+프로젝트 루트에서 실행한다.
+
 ```
-
-`build/`, `dist/`, 가상환경, 측정 로그 및 로컬 `config.yaml`은 생성물 또는
-현장별 설정이므로 Git에 포함하지 않는다.
-
-## 현장 운영 순서
-
-설치가 끝난 시스템의 운영자는 다음 순서만 따르면 된다.
-
-```text
-1. Raspberry Pi 전원 ON
-2. Nano USB 연결
-3. Ethernet 연결
-4. TUSI TMS Dashboard 실행
-5. Dashboard의 통합 상태 확인
-6. 전체 시스템 점검
-7. 측정 준비
-8. 점화
-9. 측정 종료
-```
-
-Dashboard가 password SSH 인증, local tunnel, Nano Serial 및 Pi telemetry를
-내부에서 처리한다. SSH Key는 사용하지 않는다.
-
-노트북에서 최신 GUI를 한 명령으로 실행하려면 다음을 사용한다.
-
-```bash
 ./scripts/run-tms-dashboard.sh
 ```
 
-실행 스크립트가 노트북 유선 NIC를 `10.47.0.1`로 설정한다. 고정 DHCP 범위를
-지원하는 NetworkManager에서는 직결 Pi에 `10.47.0.2`를 할당하므로, Pi가
-초기 DHCP 설정으로 부팅되어도 SSH에 접근할 수 있다. Pi의 NetworkManager
-환경은 고정 IP로 설정하고, Ubuntu Server의 `systemd-networkd` 환경은
-기존 DHCP 설정을 유지한다. 노트북 NetworkManager가 고정 DHCP 범위를
-지원하지 않으면 Pi에 `10.47.0.2`가 미리 설정되어 있어야 한다.
+노트북은 `10.47.0.1/24`, DAQ PC는 `10.47.0.2/24`를 사용한다. 실행기는 유선 경로와 DAQ 서비스를 확인하고 GUI가 ID/Password 기반 SSH 터널을 연다. 폐쇄형 현장망 기본 계정은 `tms`이며 연결 설정은 `config.yaml`에 둔다. DAQ 서비스는 `127.0.0.1:29100`만 수신한다.
 
-이어 이미 설치된 `tms-agent`가 실행 중인지 확인하며, 정상 실행 중인 agent는
-재시작하지 않는다. Pi의 NetworkManager 환경에 Wi-Fi fallback 서비스가
-설치된 경우에만 유선 연결 시 Wi-Fi를 내리고 케이블 분리 시 저장된
-`TUSI_wifi` 프로필로 복귀한다. Dashboard의 DAQ 데이터는 두 환경 모두
-`10.47.0.2`로 향하는 전용 유선 경로를 사용한다.
-접속 정보는 폐쇄망 고정값 `tms@10.47.0.2:22`이며, GUI가 Pi의
-`tms-agent`에 SSH local tunnel로 연결한다. `--direct-telemetry`는 현장
-운용에 사용하지 않는다.
+유선 인터페이스는 현재 주소로 탐색하므로 USB Ethernet의 `enx…` 이름도 지원한다. 고정 DHCP 풀이 과거 장치에 묶여 새 장치가 주소를 받지 못하는 경우와 SSH 키 변경은 [장치 관리 문서](docs/current-deployment.md)의 네트워크 복구 절차를 따른다.
 
-## 현재 구현 상태
+### DAQ PC에서 단독 실행
 
-운용 소프트웨어와 실제 장치 연결 경로가 구현되어 있다.
+설치된 DAQ PC의 앱 메뉴에서 \*\*TUSI TMS (DAQ PC 로컬)\*\*를 선택하거나 실행한다.
 
-- Arduino Nano 실제 펌웨어: GPIO debounce, rising-edge, latch, heartbeat, ARM
-- USB-4704 실제 buffered-AI ioctl, 사용자 버퍼 pinning, mmap 상태 및 원형 버퍼 소비
-- USB 분리 시 `DATA_GAP` 기록, backoff 재접속 및 저장 공간 부족 경고
-- Nano `pyserial` 자동 포트 탐색, parser, heartbeat 감시 및 재접속
-- password-only `asyncssh` 연결, local forwarding, keepalive 및 backoff
-- 길이-prefixed TCP 제어 메시지와 binary float32 DAQ block
-- Pi telemetry server와 Dashboard client
-- Dashboard 종료·Ethernet 단절과 독립적인 Pi acquisition/HDF5 logging
-- Dashboard, Setup, System Test, Logs 4개 화면
-- Dashboard 2×2 통합 콘솔: 선택 가능한 실시간 데이터 graph 2개,
-  프로그램/파이프라인 상태, 측정 시작·종료·설정 바로가기
-- 각 실시간 graph의 데이터 상자에서 추력·압력 등 수신 channel을 선택하면
-  단위, 현재값, 세션 피크, 최근 10초 범위와 graph가 함께 변경
-- 50 Hz 1차 저역통과필터(LPF)를 실시간 화면과 로그의 별도 필터 dataset에 적용
-  하며, `raw_*`와 비필터 물리값은 원본으로 함께 보존
-- 측정 전 AI0 로드셀과 AI1 압력 채널에 대해 알려진 기준점 2개 또는 3개를
-  취득하는 원점/게인 캘리브레이션 UI와 Pi 설정 저장 경로
-- Pi agent가 재시작되는 동안 정상 SSH local tunnel을 유지하고, 반복 실패 때만
-  tunnel을 교체하여 DAQ 복구 시 연결 깜빡임을 줄이는 재연결 정책
-- HDF5 session 조회, CSV 내보내기 및 SFTP Pi 로그 가져오기
-- Pi systemd service, 설치 스크립트 및 Dashboard PyInstaller 설정
-
-### 2026-08-25 실장비 검증 결과
-
-Pi (`10.47.0.2`, Ubuntu 22.04 ARM64, `5.15.0-1105-raspi`)에서 다음을
-실제 장치로 확인했다.
-
-- `bio4704`/`biokernbase` 모듈 적재, USB `1809:4704`, `/dev/daq0` 및
-  description ioctl
-- `tms-agent` systemd 서비스가 `tms:plugdev` 권한으로 기동되고 telemetry를
-  `127.0.0.1:29100`에만 bind
-- USB-4704 native buffered-AI를 5 kS/s로 취득하여 HDF5에 연속 기록
-- password SSH local forwarding으로 노트북 telemetry client를 연결, 수집 중
-  터널을 완전히 끊었다가 재접속해도 Pi 수집과 HDF5 기록이 계속됨
-- SFTP로 HDF5를 회수하고 원격 파일과 SHA-256이 일치함을 확인
-
-이 검증에서는 `TRIGGER`, AO/DO write, Nano GPIO 제어를 실행하지 않았다.
-센서의 실제 물리 단위 교정과 출력/점화 계통 시험은 아래 최종 게이트로 남긴다.
-
-Pi 로그 파일에는 다음 구조가 생성된다.
-
-```text
-/metadata
-/samples/sample_index
-/samples/raw_thrust
-/samples/raw_pressure
-/samples/thrust_N
-/samples/pressure_bar
-/samples/thrust_N_lpf
-/samples/pressure_bar_lpf
-/events
-/health
+```
+tusi-tms-local
 ```
 
-설정은 `config.example.yaml`을 복사한 `config.yaml`에서 변경한다. 실제
-비밀번호가 들어갈 수 있는 `config.yaml`, 시험 로그 및 가상환경은 Git에서
-제외된다. 비밀번호는 일반/고급 로그나 exception에 출력하지 않는다.
+로컬 모드는 같은 서비스에 `127.0.0.1`로 직접 연결한다. 노트북·SSH·Ethernet 없이 그래프, 측정, 보정, 결과 분석, HDF5·CSV 저장을 사용한다. 수집 서비스는 부팅 시 자동 시작하며 GUI는 로그인 후 실행한다. 운영 단독 실행은 `--local-daq`, `--direct-telemetry`는 개발용이다.
 
-## 개발 환경과 자동 테스트
+Nano 점화 신호를 쓰려면 **GUI를 실행하는 PC에 Nano USB를 연결**한다. 로컬 GUI 설치 시 `tms`를 `dialout` 그룹에 추가하므로 기존 로그인은 로그아웃 후 다시 로그인해야 새 권한이 반영된다. 두 GUI가 같은 장치를 공유하므로 한 측정의 시작·종료는 한쪽에서 조작한다.
 
-```bash
+## 운영 순서
+
+1. DAQ PC와 센서·앰프 전원을 켜고 USB-4704를 연결한다.
+2. 원격 또는 로컬 GUI를 실행한다. 원격이면 Ethernet도 연결한다.
+3. Nano를 사용할 때 GUI가 실행되는 PC에 USB로 연결한다.
+4. **저장 폴더 선택**으로 위치를 확인하고 전체 시스템 점검을 실행한다.
+5. 필요하면 로드셀·압력을 보정하거나 저장 프로파일을 불러온다.
+6. **측정 준비**를 눌러 점화 전부터 수집을 시작한다.
+7. **측정 종료** 후 HDF5·CSV를 확인한다.
+8. 시험 로그에서 파일을 선택해 **결과 분석**을 연다.
+
+GUI·Nano·Ethernet 연결이 끊겨도 DAQ 서비스의 수집·원본 기록은 계속된다. 점화 이벤트는 수집 시작 명령이 아니라 이미 기록 중인 데이터의 시간 기준이다.
+
+## 저장 위치
+
+측정 화면과 시험 로그 화면의 **저장 폴더 선택**은 선택 즉시 설정을 저장한다. **설정 → 수집·연결 → 저장**에서 경로 입력 후 **저장 위치 적용**도 가능하다. 현재 경로는 시험 로그 상단에 표시되며 앱을 다시 실행해도 유지된다.
+
+- 원격 모드: 노트북의 선택 폴더에 HDF5 복사본·CSV 저장.
+- 로컬 모드: DAQ PC의 선택 폴더에 HDF5 복사본·CSV 저장.
+- DAQ 서비스 원본: `/var/lib/tusi-tms/logs/`에 별도 보관.
+
+폴더 변경 때문에 수집을 재연결하지 않는다. 진행 중인 저장은 기존 폴더에 HDF5·CSV를 함께 완료하고 다음 저장부터 새 위치를 쓴다. 쓰기 검사·설정 저장 실패 시 기존 설정을 유지한다. 기존 파일을 이동하거나 덮어쓰지 않는다. 회수 실패는 시험 로그의 **Pi 로그 가져오기**(원격) 또는 **DAQ 원본 로그 가져오기**(로컬)로 재시도한다.
+
+## 보정 프로파일
+
+AI0는 로드셀, AI1은 압력으로 고정한다. 측정을 종료한 상태에서 각 보정 화면을 연다.
+
+1. 기준점 2개 또는 3개를 입력하고 각 점의 원시값을 취득한다.
+2. **보정값 계산**으로 scale·offset과 잔차를 확인한다.
+3. **설정 저장**으로 DAQ PC의 `/etc/tusi-tms/config.yaml`에 영구 저장한다.
+
+**프로파일 불러오기**는 DAQ PC에 마지막 저장된 해당 센서의 계수를 읽는다. 센서별 최신 프로파일 한 개이며 이름별 이력·기준점 데이터는 저장하지 않는다. 서비스 재시작 후에도 유지되고 다음 측정과 HDF5 메타데이터에 적용된다. 노트북 설정도 저장 응답으로 갱신한다.
+
+로드셀 기준 질량은 g, 환산 추력은 N, 압력은 bar 단위다. 압력 입력은 기본 100 Ω 션트, 4–20 mA, 0.4–2.0 V이다. 예제 계수는 실제 센서 교정값이 아니다.
+
+## 기본 필터와 결과 분석
+
+기본 화면·CSV·결과 분석은 **현재 샘플을 포함한 최근 80개의 산술평균**을 사용한다. 5 kHz에서 16 ms 구간이며 처음 79개는 확보된 샘플만 평균낸다. 시간축 이동이나 샘플 수 감소는 하지 않는다. 블록 경계에서는 이력을 유지하고 샘플 번호 누락, 비정상 값, 새 측정에서는 창을 초기화한다.
+
+DAQ 수집 단계에서 한 번 계산한 float32 값을 파일과 모든 GUI에 전달하므로 원격/로컬, 재접속 시점, 전송 묶음 크기에 따라 값이 달라지지 않는다.
+
+| 데이터 | HDF5·CSV 이름 |
+| --- | --- |
+| ADC 원본 | `raw_thrust`, `raw_pressure` |
+| 환산 원본 | `thrust_N`, `pressure_bar` |
+| 기본 표시 이동평균 | `thrust_N_ma`, `pressure_bar_ma` |
+| 보관용 LPF | `thrust_N_lpf`, `pressure_bar_lpf` |
+
+CSV에는 `moving_average_window_samples=80`도 저장한다. `low_pass` 설정은 보관용 `_lpf`에만 적용한다. 이동평균이 없는 과거 HDF5·CSV는 환산 원본에서 계산해 분석하며, 저장된 이동평균에 필터를 중복 적용하지 않는다.
+
+시험 로그의 **결과 분석** 또는 로그 더블클릭으로 추력·압력 그래프를 연다. 로그를 선택하지 않으면 HDF5·CSV 파일을 직접 선택할 수 있다.
+
+## 점화·Nano 데이터
+
+펌웨어는 `firmware/nano/nano_trigger.ino`이다. Nano는 D5 입력을 읽으며 점화를 제어하지 않는다. 외부 4.7 kΩ pull-down, `INPUT`, 20 ms debounce, 펌웨어 1.2, 115200 baud, 500 ms heartbeat를 사용한다.
+
+첫 유효 LOW→HIGH 전환을 점화 기준으로 기록한다. 처음부터 HIGH이면 과거 에지 시각을 만들지 않는다. 서비스 기록·flush 응답 후에만 GUI가 점화를 확정한다.
+
+- `ignition=1`: 점화에 연결된 한 행. `time_s=0`이다.
+- `ignition_recorded=0`: 점화 기록 없음. `time_reference=acquisition_start`.
+- `acquisition_time_s`: 수집 시작 기준 시간.
+- `nano_gpio`: 마지막 유효 LOW/HIGH. 미확인·만료는 빈칸이며 LOW가 아니다.
+- `nano_gpio_valid`, `nano_gpio_observed`: 유효 상태와 실제 보고 행 구분.
+- 점화 행의 출처·수신 정보: `ignition_source`, `nano_sequence`, `nano_uptime_ms`, `ignition_receive_time_utc`, `ignition_timing_basis`.
+
+`pi_latest_sample_on_receipt`는 서비스가 신호를 처리할 때의 최신 기록 샘플을 뜻하는 호환 이름이며 x86\_64에서도 유지한다. debounce·USB·통신 지연을 포함하므로 하드웨어 동기화된 에지 시각은 아니다. 실시간 그래프는 수집 표시 구간 기준이며, CSV·결과 분석은 점화가 있으면 점화 수신 기준, 없으면 수집 시작 기준이다.
+
+## 설치·복구
+
+현재 장치의 설치 경로와 x86\_64 DKMS 절차는 [설치·관리](docs/current-deployment.md)를 따른다. 현재 `scripts/install-dkms.sh`, `packaging/install-prebuilt.sh`는 AArch64 전용이다. 실행 중인 x86\_64 장치에 ARM64 모듈을 설치하지 않는다.
+
+DAQ 서비스가 설치된 Ubuntu 장치의 로컬 GUI 설치:
+
+```
+sudo apt install python3-venv libxcb-cursor0 libxkbcommon-x11-0 libopengl0 libegl1
+sudo ./scripts/install-local-dashboard.sh
+```
+
+설치기는 NumPy·h5py를 함께 갱신해 호환성을 맞춘다. 보정 파일은 유지한다. DAQ 초기화는 원격에서 별도 SSH/sudo, 로컬에서 OS 인증 창(`pkexec`)을 사용한다. 서비스 정지·USB 복구·재시작 후 AI0·AI1 취득/종료 두 번과 GUI 재연결로 판정한다. 자세한 종료·복구 정책은 [기술 규격](docs/system-requirements.md)을 참고한다.
+
+## 개발·빌드·테스트
+
+```
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[dashboard,test]'
 python -m pytest
 ```
 
-하드웨어 없는 전체 TCP/Dashboard 경로는 두 터미널에서 실행할 수 있다.
-이때 시뮬레이터는 USB-4704 입력만 대체하며 나머지 session, TCP, binary
-telemetry, logger와 Dashboard 코드는 실제 운용 코드다.
+외부 ROS pytest 플러그인이 수집에 개입하는 환경:
 
-```bash
-# Terminal 1: local Pi agent replacement
-tms-agent --simulate --config config.example.yaml --bind 127.0.0.1
-
-# Terminal 2: SSH만 우회하는 local Dashboard QA mode
-tusi-tms --config config.example.yaml --direct-telemetry
+```
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
 
-`--direct-telemetry`는 로컬 개발 전용이며 현장 운용에서는 사용하지 않는다.
+2026-11-11 전체 테스트는 **196개 통과**다. 실장비에서 5 kHz 수집, 원격/로컬 연결, 보정 유지, MA80 화면·HDF5·CSV·분석 일치, 두 PC의 CSV 바이트 일치, 저장 폴더와 재실행 후 경로 유지를 확인했다. 센서 물리 교정, Nano 실제 점화 배선, AO/DO, 최대 속도·장시간 운용은 별도 검증 대상이다.
 
-짧은 HDF5 self-test만 실행할 때:
+Linux: `./scripts/build-dashboard.sh` → `dist/TUSI-TMS`. Windows: `scripts/build-dashboard.ps1` → `dist/TUSI-TMS.exe`. Windows에서 이번 기능의 실기기 검증은 수행하지 않았다.
 
-```bash
-tms-agent-selftest \
-  --simulate \
-  --duration 5 \
-  --trigger-after 2 \
-  --test-name LOCAL_SIM_001
 ```
-
-## Raspberry Pi agent 설치
-
-먼저 password login이 가능한 `tms` 사용자를 생성하고, 저장소에서 설치
-스크립트를 실행한다. Ubuntu 22.04 ARM64에서는 수집 런타임을 먼저 apt로
-설치한다. 스크립트는 사용자의 password를 만들거나 변경하지 않는다.
-
-```bash
-sudo adduser tms
-sudo apt update
-sudo apt install build-essential python3-venv python3-numpy python3-h5py python3-serial python3-yaml
-sudo ./scripts/install-tms-agent.sh
-systemctl status tms-agent.service
-```
-
-Pi telemetry server는 `127.0.0.1:29100`에만 bind되며 Dashboard가 SSH local
-forwarding으로 접근한다.
-
-`tms-agent`가 시작 또는 재시작될 때 `/dev/daq0`가 이미 있으면 systemd의
-root 전용 pre-start 단계는 USB topology를 건드리지 않는다. 장치 노드가 없을
-때만 USB `1809:4704`의 logical reauthorize를 먼저 시도하고, 실패했을 때만
-USB core rebind를 마지막 수단으로 사용한다. `usbreset`은 이 장치의 실패한
-control transfer를 장시간 block할 수 있어 사용하지 않는다.
-
-Dashboard의 **DAQ 초기화** 버튼은 telemetry `PING`에 의존하지 않는 별도 SSH
-복구 경로다. agent를 정지한 뒤 USB-4704의 상위 허브 포트를 전원 재인가하여
-물리 재연결과 같은 재열거를 수행하고 agent를 다시 시작한다. 배포 Pi의 VIA
-허브는 ganged power이므로 같은 허브의 다른 downstream USB 장치도 잠깐
-재시작될 수 있다.
-
-초기화 중에는 자동 telemetry 재접속을 잠시 멈추며 기존 SSH 터널은 유지한다.
-`/dev/daq0` 생성만으로 성공을 판정하지 않고 AI0·AI1 buffered 입력 취득/종료를
-두 번 연속 검증한 뒤 Dashboard 재연결까지 확인한다. 오류 알림은 단일 비모달
-창으로 표시하므로 X로 닫을 수 있고, 연결 재시도마다 다시 뜨지 않는다.
-측정 시작/종료 확인을 기다리는 동안 중복 조작을 차단하고, 세션 ID가 다른
-화면용 데이터는 폐기한다. 종료 시에는 USB close 전에 HDF5 파일을 마감하며
-종료 watchdog이 실패하면 다음 취득을 허용하지 않고 초기화 필요 상태로 둔다.
-
-USB-4704는 USB bus-powered, 최대 500 mA 장치다. Pi kernel에
-`Undervoltage detected`가 기록되면 소프트웨어 복구만으로는 안정성을 보장할 수
-없다. 정격 Raspberry Pi 전원(5 V/3 A 이상)과 짧고 굵은 케이블을 사용하고,
-전압 경고가 재발하면 USB-4704를 외부 전원형 USB hub에 연결한 뒤 재시험한다.
-
-## Dashboard 패키징
-
-Windows PowerShell:
-
-```powershell
-.\scripts\build-dashboard.ps1
-```
-
-Ubuntu/Debian Linux:
-
-```bash
-sudo apt install python3-venv \
-  libxcb-cursor0 libxcb-image0 libxcb-icccm4 libxcb-keysyms1 libxcb-render-util0
-./scripts/build-dashboard.sh
-```
-
-결과는 `dist/TUSI-TMS` 또는 `dist/TUSI-TMS.exe`에 생성된다.
-
-Linux 번들의 NumPy/캘리브레이션 압축 아카이브까지 확인하려면:
-
-```bash
 ./dist/TUSI-TMS --self-test
 ```
 
-`TUSI-TMS self-test: calibration path OK`가 출력되어야 한다.
+개발용 모의 경로는 두 터미널에서 실행한다.
 
-## Nano firmware 빌드
-
-### 점화 감지 및 CSV 기록
-
-Nano는 점화를 **제어하지 않고**, D5 입력의 HIGH/LOW를 계속 읽는다.
-경로는 `Nano → 노트북 USB serial → SSH → Pi HDF5 → 노트북 CSV`이다.
-측정 중에는 ARM 승인 여부나 첫 점화 여부와 무관하게 HIGH/LOW 상태를 저장한다.
-상태가 LOW→HIGH로 바뀌면 첫 전환을 점화 기준으로 삼는다. 처음부터 HIGH라면
-HIGH 상태만 기록하고, 언제 켜졌는지 알 수 없으므로 점화 시점을 만들지 않는다.
-Pi의 이벤트 기록·flush 확인 후에만 `Trigger: SAMPLE ...`로 표시한다.
-종료/저장을 누르면 해당 세션의 H5 원본과 CSV를 `logs/`에 자동 저장한다.
-기존 파일은 보존하고 저장 실패 시 `Pi 로그 가져오기`로 재시도할 수 있다.
-
-- `ignition=1`: 점화 신호가 연결된 단 하나의 샘플 행. 이 행의 `time_s=0`.
-- `ignition_recorded=1`: 점화 이벤트가 있는 파일. 없으면 전체 행이 0이고
-  `time_reference=acquisition_start`, 즉 취득 시작 기준이다.
-- `acquisition_time_s`: 점화 유무와 무관한 취득 시작 기준 시간.
-- `nano_gpio`: 최근 확인한 LOW=0/HIGH=1을 유지한 상태. 수신 전·연결 단절·
-  유효기간 만료는 빈칸이며 LOW로 간주하지 않는다.
-- `nano_gpio_valid`: 해당 상태가 유효하면 1, 미확인이면 0.
-- `nano_gpio_observed`: 실제 상태 보고가 연결된 샘플 행이면 1.
-- 원본 H5의 `nano_state` 이벤트에 반복 HIGH/LOW 보고와 수신 시각을 보존한다.
-  펌웨어 1.1은 500 ms마다 HB, 양방향 전환이 20 ms 안정되면 즉시 STATE를
-  보낸다. CSV는 보고 사이의 마지막 값을 유지한 것이며 DAQ 속도로 D2를
-  직접 샘플링한 값이 아니다. 새 보고가 최대 2초 없으면 미확인으로 바뀐다.
-- 점화 행의 `ignition_source=nano`, `nano_sequence`, `nano_uptime_ms`,
-  `ignition_receive_time_utc`로 신호 출처와 노트북 수신 시각을 확인한다.
-- `time_reference=ignition_receipt`,
-  `ignition_timing_basis=pi_latest_sample_on_receipt`는 Pi가 이벤트를 처리할 때의
-  최신 로깅 샘플을 뜻한다. Nano의 20 ms debounce와 USB/SSH/DAQ 블록 지연이
-  포함되며 하드웨어 동기화된 실제 점화 에지 시각은 아니다. 통신 재시도 시
-  추가 지연될 수 있고, `nano_uptime_ms`는 UTC나 DAQ 클록이 아니다.
-
-점화 이벤트가 없는 과거 로그에 점화 시점을 임의로 추가하지 않는다.
-과거 이벤트의 Nano 출처 정보가 없다면 CSV에도 `unknown`으로 남긴다.
-
-`arduino-cli`와 `arduino:avr` core가 준비된 환경에서 다음 명령으로 컴파일한다.
-
-```bash
-./scripts/build-nano.sh
+```
+tms-agent --simulate --config config.example.yaml --bind 127.0.0.1
+tusi-tms --config config.example.yaml --direct-telemetry
 ```
 
-USB로 연결된 Nano에 업로드까지 수행할 때는 포트를 명시한다.
+Nano 빌드: `./scripts/build-nano.sh`; 업로드 시 `NANO_PORT=/dev/ttyUSB0` 지정. 기본 FQBN은 `arduino:avr:nano:cpu=atmega328old`이며 `NANO_FQBN`으로 변경한다.
 
-```bash
-NANO_PORT=/dev/ttyUSB0 ./scripts/build-nano.sh
+## 소스 구조
+
+```
+common/       설정·프로토콜·공통 필터·압력 환산
+pi/           DAQ PC/Pi 수집 서비스·드라이버 ABI·HDF5 기록
+laptop/       원격/로컬 GUI·Nano·CSV·결과 분석·저장 폴더 검증
+firmware/     Nano 점화 감지 펌웨어
+vendor/       공급사 커널 소스와 Linux 호환 수정
+scripts/      설치·빌드·네트워크·복구 실행기
+packaging/    systemd·udev·DKMS·GUI 패키징
+tests/        자동 검증
+docs/         현재 규격·배포·검증 이력
 ```
 
-Windows에서는 `scripts\build-nano.ps1`을 사용한다. 기본 대상은 구형
-bootloader Nano(`arduino:avr:nano:cpu=atmega328old`)이며 `NANO_FQBN` 환경 변수로
-호환 보드를 바꿀 수 있다.
-
-## 실장비가 필요한 최종 게이트
-
-- `Usb4704DaqSource`의 실제 buffered-AI ioctl/mmap ABI와 채널 순서 검증
-- Raspberry Pi에서 5 kS/s 장시간 취득 및 overrun/hotplug 시험
-- 센서 기준 전압, scale/offset 및 실제 물리량 교정
-- Nano firmware upload와 실제 GPIO/pull-down/debounce 시험
-- Pi udev, systemd, password SSH 및 재부팅 시험
-- 60 m Ethernet 단절/복구와 전체 지상시험 acceptance test
-
-실장비 backend는 polling 방식으로 대체하지 않는다. `--simulate` 없이 agent를
-실행하면 `/dev/daq0`의 실제 USB-4704 ioctl/mmap 경로를 사용하며, 장치 또는
-드라이버가 없으면 해당 원인이 포함된 오류를 출력한다.
-
----
-
-## USB-4704 Ubuntu 22.04 ARM64 port
-
-이 프로젝트는 Advantech USB-4704의 Linux 커널 모듈을 Raspberry Pi 4용
-Ubuntu 22.04 ARM64에서 빌드하고 배포하기 위한 작업 트리다.
-
-현재 빌드 결과와 남은 실장비 게이트는
-[USB-4704 포팅 현황](docs/usb4704-porting-status.md)에 정리되어 있다.
-
-## 현재 범위
-
-- 공급사 공통 모듈 `biokernbase.ko`
-- USB-4702/4704 장치 모듈 `bio4704.ko`
-- ARM64에서 x86 전용 DAQNavi 데몬을 호출하지 않는 udev 규칙
-- 장치 설명 ioctl을 확인하는 최소 smoke test
-
-공급사 DAQNavi 사용자 공간 라이브러리(`libbiodaq.so`,
-`libbiodaqutil.so`, `libbio4704.so`)는 최신 공개 패키지에서 x86-64
-바이너리로만 제공되므로 포함하지 않는다.
-
-## 기준 대상
-
-- OS: Ubuntu 22.04 LTS ARM64
-- Board: Raspberry Pi 4
-- 현재 배포 대상 Jammy `linux-raspi`: `5.15.0-1105-raspi`
-
-커널 모듈은 실행 중인 커널과 정확히 일치해야 한다. 대상 장비의
-`uname -r`이 다르면 해당 버전의 `linux-headers-$(uname -r)`로 다시
-빌드해야 한다.
-
-## 재현 빌드
-
-x86-64 Ubuntu 빌드 머신에서 다음 한 명령으로 Jammy ARM64 헤더와 로컬
-크로스 컴파일러를 준비하고 모듈을 만든다.
-
-```bash
-./scripts/build-jammy-arm64.sh
-```
-
-산출물은 `dist/5.15.0-1105-raspi/`와 배포용 tar.gz에 생성된다.
-
-기존 `5.15.0-1061-raspi` 대상도 다음처럼 명시해서 계속 빌드할 수 있다.
-
-```bash
-JAMMY_KERNEL_RELEASE=5.15.0-1061-raspi ./scripts/build-jammy-arm64.sh
-```
-
-이미 준비된 다른 커널 헤더를 사용할 때:
-
-```bash
-KERNEL_RELEASE=5.15.0-xxxx-raspi \
-KERNEL_DIR=/path/to/linux-headers-5.15.0-xxxx-raspi \
-ARCH=arm64 \
-CROSS_COMPILE=aarch64-linux-gnu- \
-./scripts/build-modules.sh
-```
-
-## Raspberry Pi에 설치
-
-배포 압축을 Pi에서 풀고, 실행 중인 커널이 일치하는지 확인한 뒤 설치한다.
-
-```bash
-uname -m
-uname -r
-tar -xzf usb4704-5.15.0-1105-raspi-arm64.tar.gz
-cd 5.15.0-1105-raspi
-sha256sum -c SHA256SUMS
-sudo ./install.sh
-```
-
-장치를 연결한 뒤:
-
-```bash
-lsusb -d 1809:4704
-lsmod | grep -E 'bio4704|biokernbase'
-cat /sys/class/daq/daq0/desc
-ls -l /dev/daq0
-cc -O2 -Wall -Wextra -o usb4704-smoke usb4704-smoke.c
-./usb4704-smoke
-```
-
-### 비파괴 실제 I/O 진단
-
-다음 도구는 AI 0~7의 즉시 샘플, DI 포트 및 DO readback만 반복 읽는다.
-AO나 DO에는 쓰지 않으므로 연결된 설비의 출력을 바꾸지 않는다. AI 값은
-설정된 입력 범위에 따른 raw ADC 코드다.
-
-```bash
-cc -O2 -Wall -Wextra -Werror -o usb4704-readonly-diag usb4704-readonly-diag.c
-./usb4704-readonly-diag /dev/daq0 200 50
-```
-
-DI 배선을 한 비트씩 바꾸거나 AI0에 기준 전압을 인가했을 때, 반복 출력의
-`DI` 또는 해당 `AI` raw 값이 바뀌는지 확인한다. DO/AO loopback 시험은
-출력 배선과 안전한 부하를 확인한 뒤에만 수행한다.
-
-### DKMS 설치 권장
-
-대상 Pi에서 소스 트리를 사용할 수 있다면 DKMS 설치가 권장된다. 이후
-커널 업데이트 때 두 모듈을 자동으로 다시 빌드한다.
-
-```bash
-sudo apt update
-sudo apt install dkms build-essential linux-headers-$(uname -r)
-sudo ./scripts/install-dkms.sh
-```
-
-제거:
-
-```bash
-sudo ./scripts/uninstall-dkms.sh
-```
-
-Pi에서 현재 실행 중인 커널용 산출물을 직접 만들 수도 있다.
-
-```bash
-./scripts/build-native-arm64.sh
-```
-
-## 아직 필요한 실장비 검증
-
-1. 모듈 로딩과 USB hotplug
-2. AI 기준 전압 및 보정 정확도
-3. AO 출력 전압
-4. DI/DO loopback과 counter
-5. 최대 샘플링 속도에서 장시간 buffered AI
-6. 재부팅 및 커널 업데이트 후 모듈 재빌드
+`config.yaml`, 가상환경, `build/`, `dist/`, 측정 로그는 장치 설정 또는 생성물이다. DAQ PC의 유지보수 소스는 `~/TMS-DAQ`, 설치된 실행본은 `/opt/tusi-tms`에 둔다.

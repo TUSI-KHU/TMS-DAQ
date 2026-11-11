@@ -53,7 +53,7 @@ class SystemTestRunner:
             SystemTestResult(
                 "LAN",
                 TestStatus.PASS if network_connected else TestStatus.FAIL,
-                "Pi network path connected" if network_connected else "not connected",
+                ("local loopback connection" if getattr(self.ssh, "is_local", False) else "Pi network path connected") if network_connected else "not connected",
             )
         )
         results.append(
@@ -68,6 +68,7 @@ class SystemTestRunner:
                 ),
                 "password authentication and tunnel connected"
                 if self.ssh.connected
+                else "local DAQ connection (SSH not required)" if getattr(self.ssh, "is_local", False)
                 else "direct development connection"
                 if self.telemetry.connected
                 else "not connected",

@@ -1,0 +1,14 @@
+{
+  "local_mode": true,
+  "ssh_used": false,
+  "connection": {
+    "SSH": "BYPASSED",
+    "Pi": "CONNECTED",
+    "Nano": "NOT_FOUND"
+  },
+  "displayed_samples": 15250,
+  "samples": 15850,
+  "hdf5": "/home/tms/TUSI-TMS/logs/2026-11-11_LOCAL_GUI_VERIFY_b2e919fa.h5",
+  "csv": "/home/tms/TUSI-TMS/logs/2026-11-11_LOCAL_GUI_VERIFY_b2e919fa.csv",
+  "errors": []
+}

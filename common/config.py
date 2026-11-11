@@ -120,7 +120,7 @@ class PressureInputConfig:
 
 @dataclass(frozen=True)
 class LowPassConfig:
-    """Display/log filter settings for the calibrated sensor channels."""
+    """Legacy LPF archive settings; the default display uses MA80."""
 
     enabled: bool = True
     cutoff_hz: float = 50.0

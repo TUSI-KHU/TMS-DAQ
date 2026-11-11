@@ -135,3 +135,55 @@ def test_manual_fetch_uses_selected_file_and_rejects_current_open_log(tmp_path):
     runtime._session_log_file = "different_session.h5"
     asyncio.run(runtime._fetch_remote_log(source.name))
     assert requests == [f"/pi/logs/{source.name}"]
+
+
+@pytest.mark.parametrize('kind', ['thrust', 'pressure'])
+def test_profile_load_reads_remote_config_and_keeps_dialog_token(tmp_path, monkeypatch, kind):
+    runtime, signals, _, _ = setup_runtime(tmp_path)
+    signals.calibration_profile_loaded = object()
+    expected = dict(channel=0 if kind == 'thrust' else 1, scale=.12, offset=-2.)
+    async def get_config():
+        return {'config': {'channels': {kind: expected}}}
+    runtime._backend.telemetry = SimpleNamespace(get_config=get_config)
+    received = []
+    def submit(coroutine, signal, *, operation):
+        assert signal is signals.calibration_profile_loaded
+        assert operation == 'calibration'
+        received.append(asyncio.run(coroutine))
+    monkeypatch.setattr(runtime, '_submit', submit)
+    runtime.load_calibration_profile(kind, 'dialog-123')
+    assert received == [{kind: expected, '_profile_token': 'dialog-123'}]
+
+
+def test_standalone_stop_copies_h5_and_exports_csv_without_ssh(tmp_path):
+    from laptop.local_daq import LocalDaqAccess
+    runtime, signals, _, source = setup_runtime(tmp_path)
+    from dataclasses import replace
+    runtime.local_daq = True
+    runtime.config = replace(runtime.config, logging=replace(runtime.config.logging, pi_directory=source.parent))
+    runtime._backend.ssh = LocalDaqAccess(source.parent)
+    asyncio.run(runtime._stop_and_save_session())
+    saved = runtime.config.logging.directory / source.name
+    assert saved.exists()
+    assert saved.with_suffix('.csv').exists()
+    assert source.exists()
+    assert not any(event[0] == 'operation_failed' for event in signals.events)
+
+
+def test_destination_change_during_export_keeps_hdf5_csv_together(tmp_path):
+    runtime, signals, _, source = setup_runtime(tmp_path)
+    original = runtime.config.logging.directory
+    new = tmp_path/'selected destination'
+    download = runtime._backend.ssh.download_file
+    async def change_during_copy(remote, destination):
+        runtime.set_log_directory(new)
+        return await download(remote, destination)
+    runtime._backend.ssh.download_file = change_during_copy
+    asyncio.run(runtime._stop_and_save_session())
+    assert (original/source.name).exists()
+    assert (original/source.with_suffix('.csv').name).exists()
+    assert not new.exists()
+    # Future operations use the new directory without replacing the backend.
+    asyncio.run(runtime._download_and_export(source.name))
+    assert (new/source.name).exists()
+    assert (new/source.with_suffix('.csv').name).exists()

@@ -11,10 +11,31 @@ from tempfile import NamedTemporaryFile
 
 import h5py
 import numpy as np
+from common.filtering import DEFAULT_MOVING_WINDOW_SAMPLES, MovingAverage
 
 
 class LogError(RuntimeError):
     """Raised when a TMS log cannot be read or exported."""
+
+
+class MovingAverageLogReader:
+    """Read saved MA values, or filter older calibrated logs in bounded chunks."""
+
+    def __init__(self, data: h5py.File) -> None:
+        self.samples = data["samples"]
+        self._filters = (MovingAverage(), MovingAverage())
+        self._stored = (
+            int(data["metadata"].attrs.get("moving_average_window_samples", 0)) == DEFAULT_MOVING_WINDOW_SAMPLES
+            and all(name in self.samples for name in ("thrust_N_ma", "pressure_bar_ma"))
+        )
+
+    def read(self, start: int, end: int, indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self._stored:
+            return self.samples["thrust_N_ma"][start:end], self.samples["pressure_bar_ma"][start:end]
+        return tuple(
+            filt.apply_indexed(self.samples[name][start:end], indices).astype(np.float32)
+            for filt, name in zip(self._filters, ("thrust_N", "pressure_bar"))
+        )
 
 
 @dataclass(frozen=True)
@@ -218,6 +239,7 @@ def export_csv(
             # unfiltered physical values are used as a compatibility fallback.
             thrust_lpf = samples.get("thrust_N_lpf", samples["thrust_N"])
             pressure_lpf = samples.get("pressure_bar_lpf", samples["pressure_bar"])
+            moving_reader = MovingAverageLogReader(data)
             sample_rate = float(data["metadata"].attrs["sample_rate"])
             if not np.isfinite(sample_rate) or sample_rate <= 0:
                 raise LogError("invalid sample rate in HDF5 log")
@@ -237,6 +259,9 @@ def export_csv(
                     "pressure_bar",
                     "thrust_N_lpf",
                     "pressure_bar_lpf",
+                    "thrust_N_ma",
+                    "pressure_bar_ma",
+                    "moving_average_window_samples",
                     "acquisition_time_s",
                     "ignition",
                     "ignition_recorded",
@@ -255,6 +280,7 @@ def export_csv(
             for start in range(0, count, chunk_samples):
                 end = min(start + chunk_samples, count)
                 indices = samples["sample_index"][start:end]
+                thrust_ma, pressure_ma = moving_reader.read(start, end, indices)
                 origin = (
                     summary.trigger_sample if summary.trigger_sample is not None else 0
                 )
@@ -283,6 +309,9 @@ def export_csv(
                     samples["pressure_bar"][start:end],
                     thrust_lpf[start:end],
                     pressure_lpf[start:end],
+                    thrust_ma,
+                    pressure_ma,
+                    repeat(DEFAULT_MOVING_WINDOW_SAMPLES),
                     indices.astype(np.float64) / sample_rate,
                     markers.astype(np.uint8),
                     repeat(int(recorded)),

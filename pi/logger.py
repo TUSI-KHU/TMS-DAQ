@@ -12,7 +12,7 @@ import h5py
 import numpy as np
 
 from common.config import TmsConfig
-from common.filtering import FirstOrderLowPass
+from common.filtering import DEFAULT_MOVING_WINDOW_SAMPLES, FirstOrderLowPass, MovingAverage
 from pi.daq import DaqBlock
 
 SOFTWARE_VERSION = "0.1.0"
@@ -49,6 +49,7 @@ class Hdf5SessionLogger:
         self._last_flush = 0.0
         self._thrust_filter: FirstOrderLowPass | None = None
         self._pressure_filter: FirstOrderLowPass | None = None
+        self._moving_filters = (MovingAverage(), MovingAverage())
 
     @property
     def path(self) -> Path:
@@ -68,6 +69,8 @@ class Hdf5SessionLogger:
         self._expected_sequence = None
         self._expected_sample_index = None
         self._samples_written = 0
+        for filt in self._moving_filters:
+            filt.reset()
         self._thrust_filter = FirstOrderLowPass(
             self._config.daq.sample_rate,
             self._config.low_pass.cutoff_hz,
@@ -90,6 +93,8 @@ class Hdf5SessionLogger:
         metadata_group.attrs["start_time"] = metadata.start_time
         metadata_group.attrs["sample_rate"] = self._config.daq.sample_rate
         metadata_group.attrs["software_version"] = SOFTWARE_VERSION
+        metadata_group.attrs["display_filter"] = "moving_average"
+        metadata_group.attrs["moving_average_window_samples"] = DEFAULT_MOVING_WINDOW_SAMPLES
         config_data = self._config.as_dict()
         metadata_group.attrs["daq_configuration"] = json.dumps(
             config_data["daq"], sort_keys=True
@@ -161,6 +166,11 @@ class Hdf5SessionLogger:
             ),
         }
 
+        for name in ("thrust_N_ma", "pressure_bar_ma"):
+            self._datasets[name] = samples.create_dataset(
+                name, shape=(0,), maxshape=(None,), chunks=(chunk_samples,), dtype="<f4"
+            )
+
         event_dtype = np.dtype(
             [
                 ("event_type", "S32"),
@@ -222,6 +232,8 @@ class Hdf5SessionLogger:
                 self._thrust_filter.reset()
             if self._pressure_filter is not None:
                 self._pressure_filter.reset()
+            for filt in self._moving_filters:
+                filt.reset()
 
         raw_thrust = block.column_for_channel(self._config.thrust.channel).astype(
             np.int32, copy=False
@@ -242,6 +254,12 @@ class Hdf5SessionLogger:
             block.first_sample_index + block.sample_count,
             dtype=np.uint64,
         )
+        moving = block.moving_average_values
+        if moving is None:
+            moving = np.column_stack([
+                filt.apply_indexed(signal, sample_indices)
+                for filt, signal in zip(self._moving_filters, (thrust, pressure))
+            ]).astype(np.float32)
 
         start = self._samples_written
         end = start + block.sample_count
@@ -253,6 +271,8 @@ class Hdf5SessionLogger:
             "pressure_bar": pressure.astype(np.float32),
             "thrust_N_lpf": thrust_lpf.astype(np.float32),
             "pressure_bar_lpf": pressure_lpf.astype(np.float32),
+            "thrust_N_ma": moving[:, 0],
+            "pressure_bar_ma": moving[:, 1],
         }
         for name, data in values.items():
             dataset = self._datasets[name]

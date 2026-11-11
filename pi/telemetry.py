@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from common.config import TmsConfig
-from common.filtering import FirstOrderLowPass
+from common.filtering import MovingAverage
 from common.protocol import (
     MessageType,
     ProtocolError,
@@ -426,16 +426,8 @@ class TelemetryServer:
         last_send = time.monotonic()
         previous_block: DaqBlock | None = None
         session_id = self.agent.session_id
-        thrust_filter = FirstOrderLowPass(
-            self.config.daq.sample_rate,
-            self.config.low_pass.cutoff_hz,
-            self.config.low_pass.enabled,
-        )
-        pressure_filter = FirstOrderLowPass(
-            self.config.daq.sample_rate,
-            self.config.low_pass.cutoff_hz,
-            self.config.low_pass.enabled,
-        )
+        thrust_filter = MovingAverage()
+        pressure_filter = MovingAverage()
         while True:
             if session_id != self.agent.session_id:
                 # An old display batch can outlive STOP/START acknowledgements.
@@ -524,8 +516,8 @@ class TelemetryServer:
         self,
         block: DaqBlock,
         *,
-        thrust_filter: FirstOrderLowPass | None = None,
-        pressure_filter: FirstOrderLowPass | None = None,
+        thrust_filter: MovingAverage | None = None,
+        pressure_filter: MovingAverage | None = None,
     ) -> WireMessage:
         thrust = block.column_for_channel(self.config.thrust.channel).astype(np.float64)
         pressure = block.column_for_channel(self.config.pressure.channel).astype(
@@ -533,19 +525,14 @@ class TelemetryServer:
         )
         thrust = thrust * self.config.thrust.scale + self.config.thrust.offset
         pressure = pressure * self.config.pressure.scale + self.config.pressure.offset
-        thrust_filter = thrust_filter or FirstOrderLowPass(
-            self.config.daq.sample_rate,
-            self.config.low_pass.cutoff_hz,
-            self.config.low_pass.enabled,
-        )
-        pressure_filter = pressure_filter or FirstOrderLowPass(
-            self.config.daq.sample_rate,
-            self.config.low_pass.cutoff_hz,
-            self.config.low_pass.enabled,
-        )
-        thrust = thrust_filter.apply(thrust)
-        pressure = pressure_filter.apply(pressure)
-        values = np.column_stack((thrust, pressure)).astype(np.float32)
+        thrust_filter = thrust_filter or MovingAverage()
+        pressure_filter = pressure_filter or MovingAverage()
+        if block.moving_average_values is not None:
+            values = block.moving_average_values
+        else:
+            thrust = thrust_filter.apply(thrust)
+            pressure = pressure_filter.apply(pressure)
+            values = np.column_stack((thrust, pressure)).astype(np.float32)
         return make_daq_data_message(
             sequence=block.sequence,
             first_sample_index=block.first_sample_index,
@@ -582,4 +569,6 @@ class TelemetryServer:
                 [block.raw_samples for block in blocks], axis=0
             ),
             session_id=first.session_id,
+            moving_average_values=(np.concatenate([block.moving_average_values for block in blocks])
+                if all(block.moving_average_values is not None for block in blocks) else None),
         )

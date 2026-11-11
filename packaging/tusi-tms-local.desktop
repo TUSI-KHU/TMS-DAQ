@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TUSI TMS (Local DAQ)
+Name[ko]=TUSI TMS (DAQ PC 로컬)
+Comment=Local acquisition, calibration and HDF5/CSV logging
+Exec=/usr/local/bin/tusi-tms-local
+Icon=applications-science
+Terminal=false
+Categories=Science;Education;
+StartupNotify=true

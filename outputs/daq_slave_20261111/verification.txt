@@ -1,0 +1,10 @@
+tms
+Linux tms 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC  x86_64 x86_64 x86_64 GNU/Linux
+lo               UNKNOWN        127.0.0.1/8 
+wlo1             UP             192.168.0.212/24 
+enx00e04c3603ee  UP             10.47.0.2/24 
+advantech-usb4704/20260306, 6.8.0-138-generic, x86_64: installed
+enabled
+active
+crw-rw----+ 1 root plugdev 235, 0 Nov 11 17:45 /dev/daq0
+LISTEN 0      100        127.0.0.1:29100      0.0.0.0:*          

@@ -121,23 +121,25 @@ remote_direct_sudo() {
 remote_configure_ethernet() {
     remote_direct_sudo "
 set -euo pipefail
+remote_iface=\$(ip -4 -o addr show | awk '\$4 == \"$PI_IP/$CIDR_PREFIX\" {print \$2; exit}')
+[[ -n \$remote_iface ]] || { echo 'Cannot identify DAQ wired interface' >&2; exit 1; }
 if ! command -v nmcli >/dev/null || ! systemctl is-active --quiet NetworkManager; then
     # Ubuntu Server uses networkd/netplan. Its DHCP configuration is already
     # persistent, and the laptop reserves the operator address for this link.
     if systemctl is-active --quiet systemd-networkd && \\
-       ip -4 -o addr show dev eth0 | awk '{print \$4}' | grep -Fxq '$PI_IP/$CIDR_PREFIX'; then
-        echo 'Pi eth0: systemd-networkd, using the wired DHCP reservation $PI_IP'
+       ip -4 -o addr show dev \$remote_iface | awk '{print \$4}' | grep -Fxq '$PI_IP/$CIDR_PREFIX'; then
+        echo 'Pi \$remote_iface: systemd-networkd, using the wired DHCP reservation $PI_IP'
         exit 0
     fi
-    echo 'Pi has no active supported Ethernet manager or expected eth0 address' >&2
+    echo 'Pi has no active supported Ethernet manager or expected \$remote_iface address' >&2
     exit 1
 fi
 profile='$PI_PROFILE'
 if ! nmcli -g NAME connection show | grep -Fxq \"\$profile\"; then
-    nmcli connection add type ethernet ifname eth0 con-name \"\$profile\"
+    nmcli connection add type ethernet ifname \$remote_iface con-name \"\$profile\"
 fi
 nmcli connection modify \"\$profile\" \\
-    connection.interface-name eth0 \\
+    connection.interface-name \$remote_iface \\
     connection.autoconnect yes \\
     connection.autoconnect-priority 100 \\
     ipv4.method manual \\
@@ -146,10 +148,10 @@ nmcli connection modify \"\$profile\" \\
     ipv4.route-metric 700 \\
     ipv4.routes '' \\
     ipv6.method disabled
-current_connection=\$(nmcli -g GENERAL.CONNECTION device show eth0 || true)
-current_address=\$(ip -4 -o addr show dev eth0 | awk '{print \$4}' | grep -Fx '$PI_IP/$CIDR_PREFIX' || true)
+current_connection=\$(nmcli -g GENERAL.CONNECTION device show \$remote_iface || true)
+current_address=\$(ip -4 -o addr show dev \$remote_iface | awk '{print \$4}' | grep -Fx '$PI_IP/$CIDR_PREFIX' || true)
 if [[ \"\$current_connection\" != \"\$profile\" || -z \"\$current_address\" ]]; then
-    nmcli connection up \"\$profile\" ifname eth0
+    nmcli connection up \"\$profile\" ifname \$remote_iface
 fi
 "
 }
@@ -199,7 +201,7 @@ if command -v nmcli >/dev/null && systemctl is-active --quiet NetworkManager; th
             connection.autoconnect yes \\
             connection.autoconnect-priority 50
     fi
-    if systemctl cat tms-network-failover.service >/dev/null 2>&1; then
+    if [[ -d /sys/class/net/eth0 && -d /sys/class/net/wlan0 ]] && systemctl cat tms-network-failover.service >/dev/null 2>&1; then
         systemctl enable --now tms-network-failover.service
     fi
 fi
@@ -227,7 +229,7 @@ check_pi_host_route "$interface"
 log "waiting for direct Pi SSH over $interface"
 wait_for_direct_ssh
 
-log "configuring Pi eth0 as $PI_IP/$CIDR_PREFIX"
+log "configuring DAQ wired interface as $PI_IP/$CIDR_PREFIX"
 remote_configure_ethernet
 
 log "ensuring tms-agent is active over the direct link"

@@ -1,0 +1,8 @@
+{
+  "csv": "/home/tms/TUSI-TMS/folder-selection-verification/2026-11-11_FOLDER_SELECTION_VERIFY_092b4646.csv",
+  "hdf5": "/home/tms/TUSI-TMS/folder-selection-verification/2026-11-11_FOLDER_SELECTION_VERIFY_092b4646.h5",
+  "folder_persisted": true,
+  "folder_restored": true,
+  "acquisition_reconnected": false,
+  "errors": []
+}

@@ -13,6 +13,7 @@ import numpy as np
 
 from common.config import TmsConfig
 from common.protocol import TelemetryBlock
+from laptop.local_daq import LocalDaqAccess
 from laptop.nano import NanoMessage, NanoSerialManager, NanoStatus
 from laptop.ssh_client import SshConnectionError, SshFailureKind, SshTunnelManager
 from laptop.telemetry import RemoteCommandError, TelemetryClient, TelemetryError
@@ -45,19 +46,26 @@ class DashboardBackend:
         ssh_manager: SshTunnelManager | None = None,
         telemetry_client: TelemetryClient | None = None,
         direct_telemetry: bool = False,
+        local_daq: bool = False,
     ) -> None:
-        self.config = config
+        self.config = (
+            replace(config, system=replace(config.system, pi_host="127.0.0.1"))
+            if local_daq else config
+        )
         self.connection_callback = connection_callback
         self.block_callback = block_callback
         self.health_callback = health_callback
         self.error_callback = error_callback
         self.telemetry = telemetry_client or TelemetryClient()
-        self.direct_telemetry = direct_telemetry
+        self.local_daq = local_daq
+        self.direct_telemetry = direct_telemetry or local_daq
         self.ssh = ssh_manager or SshTunnelManager(
             config.system,
             config.ssh,
             status_callback=lambda status: self._connection("SSH", status),
         )
+        if local_daq and ssh_manager is None:
+            self.ssh = LocalDaqAccess(config.logging.pi_directory)
         self.nano = nano_manager or NanoSerialManager(
             config.nano,
             trigger_callback=self._nano_trigger,

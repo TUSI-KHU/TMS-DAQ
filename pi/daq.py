@@ -29,6 +29,7 @@ class DaqBlock:
     channel_numbers: tuple[int, ...]
     raw_samples: NDArray[np.integer]
     session_id: str | None = None
+    moving_average_values: NDArray[np.float32] | None = None
 
     def __post_init__(self) -> None:
         if self.sequence < 0 or self.first_sample_index < 0:
@@ -45,6 +46,8 @@ class DaqBlock:
             raise ValueError("channel_numbers must be unique")
         if not np.issubdtype(self.raw_samples.dtype, np.integer):
             raise ValueError("raw_samples must use an integer dtype")
+        if self.moving_average_values is not None and self.moving_average_values.shape != (self.sample_count, 2):
+            raise ValueError("moving_average_values must have shape (samples, 2)")
 
     @property
     def sample_count(self) -> int:

@@ -416,3 +416,108 @@ def test_pressure_calibration_dialog_collects_ai1_points_and_fits() -> None:
     assert dialog._fit.scale_bar_per_count == pytest.approx(0.005)
     assert dialog.apply_button.isEnabled()
     dialog.close()
+
+
+@pytest.mark.parametrize('dialog_type,kind,channel', [
+    (LoadCellCalibrationDialog, 'thrust', 0),
+    (PressureCalibrationDialog, 'pressure', 1),
+])
+def test_calibration_profile_load_save_and_failure(dialog_type, kind, channel):
+    app = QApplication.instance() or QApplication([])
+    dialog = dialog_type(current_scale=1.0, current_offset=0.0)
+    requested, saved = [], []
+    dialog.load_requested.connect(lambda *args: requested.append(args))
+    dialog.save_requested.connect(lambda *args: saved.append(args))
+    dialog.load_button.click()
+    assert requested == [(kind, dialog.profile_token)]
+    assert not dialog.load_button.isEnabled()
+    dialog.operation_failed('connection lost')
+    assert dialog.load_button.isEnabled()
+    assert not dialog.apply_button.isEnabled()
+    dialog.load_button.click()
+    result = {kind: {'channel': channel, 'scale': 0.125, 'offset': -30.0}}
+    dialog.profile_loaded(result)
+    assert dialog.fit is None
+    assert dialog.apply_button.isEnabled()
+    dialog.apply_button.click()
+    assert saved == [(0.125, -30.0)]
+    assert not dialog.reference_table.isEnabled()
+    dialog.calibration_saved(result)
+    assert dialog.reference_table.isEnabled()
+    dialog._mass_fields[0].setValue(1)
+    assert not dialog.apply_button.isEnabled()
+    dialog.close()
+
+
+def test_profile_response_is_not_applied_to_another_dialog(idle_window):
+    window = idle_window
+    dialog = LoadCellCalibrationDialog(current_scale=1., current_offset=0.)
+    window._calibration_dialog = dialog
+    before = window.config
+    window._calibration_profile_loaded({'_profile_token': 'closed-dialog',
+        'thrust': dict(channel=0, scale=.5, offset=-10.)})
+    assert window.config == before
+    assert dialog._loaded_values is None
+    window._calibration_dialog = None
+    dialog.close()
+
+
+def test_result_viewer_plots_moving_average_columns(tmp_path):
+    from laptop.analysis import AnalysisData
+    from laptop.gui.analysis_dialog import ResultAnalysisDialog
+    app = QApplication.instance() or QApplication([])
+    data = AnalysisData(tmp_path/'result.h5', np.arange(100), np.arange(100)/5000,
+                        np.arange(100, dtype=np.float32)/2, np.ones(100,dtype=np.float32), '수집 시작 기준')
+    dialog = ResultAnalysisDialog(data)
+    for curve, expected in zip(dialog.curves, (data.thrust_N, data.pressure_bar)):
+        np.testing.assert_array_equal(curve.getData()[1], expected)
+    dialog.close()
+
+
+@pytest.mark.parametrize('local_daq', [False, True])
+def test_log_folder_selection_is_persisted_without_reconnect(tmp_path, monkeypatch, local_daq):
+    from common.config import load_config
+    from PySide6.QtWidgets import QFileDialog
+    from types import SimpleNamespace
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow, '_start_runtime', lambda self: None)
+    path = tmp_path/'settings.yaml'
+    config = TmsConfig(daq=DaqConfig(), thrust=ChannelConfig(0,1,0),
+                       pressure=ChannelConfig(1,1,0), logging=LoggingConfig(directory=tmp_path/'old'))
+    window = MainWindow(config, path, local_daq=local_daq)
+    updates = []
+    def no_disconnect():
+        raise AssertionError('Folder change must not disconnect the acquisition client')
+    window._runtime = SimpleNamespace(set_log_directory=updates.append, stop=no_disconnect)
+    selected = tmp_path/'selected logs'
+    monkeypatch.setattr(QFileDialog, 'getExistingDirectory', lambda *args: str(selected))
+    window._log_directory_buttons[0].click()
+    assert load_config(path).logging.directory == selected
+    assert window.config.logging.pi_directory == config.logging.pi_directory
+    assert updates == [selected]
+    assert window.log_directory.text() == str(selected)
+    assert window.saved_log_directory.text() == str(selected)
+    assert all(str(selected) in button.toolTip() for button in window._log_directory_buttons)
+    # Cancelling the picker must leave the selected destination unchanged.
+    monkeypatch.setattr(QFileDialog, 'getExistingDirectory', lambda *args: '')
+    window._choose_log_directory()
+    assert updates == [selected]
+    window._runtime = None
+    window.close()
+    reloaded = MainWindow(load_config(path), path, local_daq=local_daq)
+    assert reloaded.log_directory.text() == str(selected)
+    reloaded.close()
+
+
+def test_log_folder_failure_keeps_previous_settings(idle_window, monkeypatch):
+    from laptop.gui import main_window as module
+    window = idle_window
+    old_config = window.config
+    warnings = []
+    def denied(_path):
+        raise PermissionError('read-only volume')
+    monkeypatch.setattr(module, 'prepare_log_directory', denied)
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: warnings.append(args[-1]))
+    window._save_log_directory('/read-only')
+    assert window.config == old_config
+    assert warnings and 'read-only volume' in warnings[0]

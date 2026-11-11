@@ -38,7 +38,8 @@ pressure_input:
   loop_min_mA: 4.0
   loop_max_mA: 20.0
 
-# Causal one-pole LPF applied to live telemetry and additional *_lpf datasets.
+# Additional archival *_lpf datasets. Live display/CSV/result analysis use
+# the shared 80-sample moving average (*_ma), independently of these settings.
 # Existing raw_* and unfiltered physical datasets are retained unchanged.
 low_pass:
   enabled: true

@@ -15,7 +15,7 @@ from pi.tms_agent import AgentState, TmsAgent
 from pi.recovery_probe import verify
 
 
-def test_live_telemetry_uses_low_pass_values(tmp_path) -> None:
+def test_live_telemetry_uses_moving_average_values(tmp_path) -> None:
     config = TmsConfig(
         daq=DaqConfig(sample_rate=1_000, block_ms=10),
         thrust=ChannelConfig(channel=0, scale=1.0, offset=0.0),
@@ -30,12 +30,13 @@ def test_live_telemetry_uses_low_pass_values(tmp_path) -> None:
         first_sample_index=0,
         sample_rate=1_000,
         channel_numbers=(0, 1),
-        raw_samples=np.asarray(((0, 0), (100, 100)), dtype=np.uint16),
+        raw_samples=np.asarray(((0, 0), (100, 100), (100, 100)), dtype=np.uint16),
     )
 
     decoded = decode_daq_data(server._telemetry_message(block))
     assert decoded.values[0, 0] == 0.0
-    assert 0.0 < decoded.values[1, 0] < 100.0
+    assert decoded.values[1, 0] == 50.0
+    assert decoded.values[2, 0] == pytest.approx(200 / 3)
     assert decoded.values[1, 1] == decoded.values[1, 0]
 
 
@@ -501,4 +502,38 @@ def test_timed_out_start_is_cancelled_and_requires_daq_recovery(tmp_path) -> Non
                 "START_SESSION", agent.start_session, "SECOND_START", timeout=0.02
             )
 
+    asyncio.run(scenario())
+
+
+def test_calibration_profiles_survive_service_restart(tmp_path):
+    from common.config import load_config, save_config
+
+    async def scenario():
+        path = tmp_path / 'config.yaml'
+        config = TmsConfig(daq=DaqConfig(), thrust=ChannelConfig(0, 1., 0.),
+                           pressure=ChannelConfig(1, 1., 0.), logging=LoggingConfig(directory=tmp_path))
+        save_config(config, path)
+        async def start(config):
+            agent = TmsAgent(config, SimulatedDaqSource(config.daq, (0, 1)))
+            server = TelemetryServer(agent, config, port=0,
+                config_update_callback=lambda value: save_config(value, path))
+            await server.start()
+            client = TelemetryClient()
+            await client.connect(port=server.port)
+            return server, client
+        server, client = await start(config)
+        try:
+            await client.set_thrust_calibration(scale_N_per_count=-.25, offset_N=2500.)
+            await client.set_pressure_calibration(scale_bar_per_count=.0025, offset_bar=-2.5)
+        finally:
+            await client.disconnect()
+            await server.close()
+        server, client = await start(load_config(path))
+        try:
+            channels = (await client.get_config())['config']['channels']
+            assert channels['thrust'] == dict(channel=0, scale=-.25, offset=2500.)
+            assert channels['pressure'] == dict(channel=1, scale=.0025, offset=-2.5)
+        finally:
+            await client.disconnect()
+            await server.close()
     asyncio.run(scenario())
